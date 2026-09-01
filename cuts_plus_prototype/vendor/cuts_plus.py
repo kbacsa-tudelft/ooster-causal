@@ -1,7 +1,13 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Only the trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file
-# not present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the real CLI
-# entry point lives in the parent UNN repo. Everything else is unmodified.
+# see ../LICENSE). Two deliberate deviations from upstream, both performance-only (same math, same
+# results, no behavior change) - kept as the only edits so this stays otherwise faithful to the source:
+#   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
+#      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
+#      real CLI entry point lives in the parent UNN repo.
+#   2. batch_generater's per-sample Python loop was vectorized, and MultiCAD.train()'s per-batch
+#      `.item()` calls (each a blocking CPU/GPU sync) were deduplicated and rate-limited to every
+#      LOG_EVERY_N_BATCHES batches instead of every batch - see LOG_EVERY_N_BATCHES below. Both were
+#      identified as the cause of low GPU utilization on real hardware.
 
 import logging
 import os, sys
@@ -34,6 +40,9 @@ from model.cuts_plus_net import CUTS_Plus_Net
 
 import os
 from einops import rearrange
+
+LOG_EVERY_N_BATCHES = 10  # perf patch: how often to sync losses to CPU for logging/progress display
+
 
 def plot_matrix(name, mat, log, log_step, vmin=None, vmax=None):
     if len(mat.shape) == 3:
@@ -69,21 +78,25 @@ def batch_generater(data, observ_mask, bs, n_nodes, input_step, pred_step, block
     first_sample_t = input_step
     random_t_list = generate_indices(input_step, pred_step, t_length=t, block_size=block_size)
 
-    for batch_i in range(len(random_t_list) // bs):
-        x = torch.zeros([bs, n_nodes, input_step, d]).to(data.device)
-        y = torch.zeros([bs, n_nodes, pred_step, d]).to(data.device)
-        t = torch.zeros([bs]).to(data.device).long()
-        mask_x = torch.zeros([bs, n_nodes, input_step, d]).to(data.device)
-        mask_y = torch.zeros([bs, n_nodes, pred_step, d]).to(data.device)
-        for data_i in range(bs):
-            data_t = random_t_list.pop()
-            x[data_i, :, :, :] = rearrange(data[data_t-input_step : data_t, :], "t n d -> n t d")
-            y[data_i, :, :, :] = rearrange(data[data_t : data_t+pred_step, :], "t n d -> n t d")
-            t[data_i] = data_t
-            mask_x[data_i, :, :, :] = rearrange(observ_mask[data_t-input_step : data_t, :], "t n d -> n t d")
-            mask_y[data_i, :, :, :] = rearrange(observ_mask[data_t:data_t+pred_step, :], "t n d -> n t d")
+    # perf patch: the original built each batch with a Python for-loop assigning one sample's
+    # window at a time (bs individual GPU slice-and-copy ops per batch). Vectorized into a single
+    # gather per tensor - same result, far fewer GPU kernel launches per batch.
+    x_offsets = torch.arange(-input_step, 0, device=data.device, dtype=torch.long)
+    y_offsets = torch.arange(0, pred_step, device=data.device, dtype=torch.long)
 
-        yield x, y, t, mask_x, mask_y
+    for batch_i in range(len(random_t_list) // bs):
+        batch_t = [random_t_list.pop() for _ in range(bs)]
+        t_idx = torch.tensor(batch_t, device=data.device, dtype=torch.long)  # (bs,)
+
+        x_idx = t_idx.unsqueeze(1) + x_offsets.unsqueeze(0)  # (bs, input_step)
+        y_idx = t_idx.unsqueeze(1) + y_offsets.unsqueeze(0)  # (bs, pred_step)
+
+        x = data[x_idx].permute(0, 2, 1, 3)          # (bs, input_step, n, d) -> (bs, n, input_step, d)
+        y = data[y_idx].permute(0, 2, 1, 3)           # (bs, pred_step, n, d) -> (bs, n, pred_step, d)
+        mask_x = observ_mask[x_idx].permute(0, 2, 1, 3)
+        mask_y = observ_mask[y_idx].permute(0, 2, 1, 3)
+
+        yield x, y, t_idx, mask_x, mask_y
 
 
 
@@ -305,13 +318,18 @@ class MultiCAD(object):
 
                 data_pred = deepcopy(data) # masked data points are predicted
                 data_pred_all = deepcopy(data)
-                for x, y, t, mask_x, mask_y in batch_gen:
+                for batch_idx, (x, y, t, mask_x, mask_y) in enumerate(batch_gen):
                     latent_pred_step += self.args.batch_size
                     y_pred, loss = self.latent_data_pred(x, y, mask_x, mask_y)
                     data_pred[t] = (y_pred*(1-mask_y) + y*mask_y).clone().detach()[:,:,0]
                     data_pred_all[t] = y_pred.clone().detach()[:,:,0]
-                    self.log.log_metrics({"latent_data_pred/pred_loss": loss.item()}, latent_pred_step)
-                    pbar.set_postfix_str(f"S1 loss={loss.item():.2f}, spr=IDLE, auc={auc:.4f}")
+                    # perf patch: .item() is a blocking CPU/GPU sync - only pay for it every
+                    # LOG_EVERY_N_BATCHES batches, and only once (previously called twice for the
+                    # same value: once for logging, once for the progress bar).
+                    if batch_idx % LOG_EVERY_N_BATCHES == 0:
+                        loss_value = loss.item()
+                        self.log.log_metrics({"latent_data_pred/pred_loss": loss_value}, latent_pred_step)
+                        pbar.set_postfix_str(f"S1 loss={loss_value:.2f}, spr=IDLE, auc={auc:.4f}")
 
                 current_data_pred_lr = self.data_pred_optimizer.param_groups[0]['lr']
                 self.log.log_metrics({"graph_discov/lr": current_data_pred_lr}, latent_pred_step)
@@ -324,16 +342,21 @@ class MultiCAD(object):
 
             # Graph Discovery
             if hasattr(self.args, "graph_discov"):
-                for x, y, t, mask_x, mask_y in batch_gen:
+                for batch_idx, (x, y, t, mask_x, mask_y) in enumerate(batch_gen):
                     graph_discov_step += self.args.batch_size
                     if hasattr(self.args, "disable_graph") and self.args.disable_graph:
                         pass
                     else:
                         loss, loss_sparsity, loss_data = self.graph_discov(x, y, mask_x, mask_y)
-                        self.log.log_metrics({"graph_discov/sparsity_loss": loss_sparsity.item(),
-                                            "graph_discov/data_loss": loss_data.item(),
-                                            "graph_discov/total_loss": loss.item()}, graph_discov_step)
-                        pbar.set_postfix_str(f"S2 loss={loss_data.item():.2f}, spr={loss_sparsity.item():.2f}, auc={auc:.4f}")
+                        # perf patch: see the matching comment in the S1 loop above.
+                        if batch_idx % LOG_EVERY_N_BATCHES == 0:
+                            loss_value, loss_sparsity_value, loss_data_value = (
+                                loss.item(), loss_sparsity.item(), loss_data.item())
+                            self.log.log_metrics({"graph_discov/sparsity_loss": loss_sparsity_value,
+                                                "graph_discov/data_loss": loss_data_value,
+                                                "graph_discov/total_loss": loss_value}, graph_discov_step)
+                            pbar.set_postfix_str(
+                                f"S2 loss={loss_data_value:.2f}, spr={loss_sparsity_value:.2f}, auc={auc:.4f}")
 
                 self.graph_scheduler.step()
                 # self.group_scheduler.step()
