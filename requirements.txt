@@ -69,7 +69,9 @@ nbformat==5.10.4
 nest-asyncio
 nest-asyncio2
 networkx
+omegaconf
 pandas
+pytest
 torch
 tensorboard
 pillow
