@@ -67,6 +67,7 @@ class CUTSPlusRCAConfig:
     n_groups: int = 32
     group_policy: str = 'multiply_2_every_5'
     show_graph_every: int = 1000  # effectively never - keep runs cheap
+    graph_plot_every: int = 10  # log a labeled adjacency-matrix figure to TensorBoard every N epochs
 
     # Root-cause / EVT thresholds (same semantics as aerca.AERCAConfig)
     causal_quantile: float = 0.80
@@ -336,13 +337,21 @@ def run_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_plus_rca')
                     stdout=False, stderr=False, tensorboard=True)
 
     print(f'Training CUTS+ on {train_len} timesteps ({n_nodes} variables) using device={device}')
+    channel_names = [f'var_{i}' for i in range(n_nodes)]
+
+    def plot_epoch_graph(epoch_i, raw_graph):
+        # raw_graph is untransposed (row=cause, col=effect) - transpose to match this pipeline's
+        # display convention (row=effect, col=cause), same as the final graph below.
+        if (epoch_i + 1) % config.graph_plot_every == 0:
+            log.log_figures(plot_labeled_adjacency(raw_graph.T, channel_names), name='causal_graph',
+                             iters=epoch_i + 1)
+
     multicad = MultiCAD(opt, log, device=device)
     train_norm = normalize(train_data)
     train_mask = np.ones_like(train_norm)
     graph = multicad.train(train_norm[:, :, None], train_mask[:, :, None], train_norm[:, :, None],
-                            true_cm=causal_struct_value)
+                            true_cm=causal_struct_value, epoch_callback=plot_epoch_graph)
 
-    channel_names = [f'var_{i}' for i in range(n_nodes)]
     log.log_figures(plot_labeled_adjacency(graph, channel_names), name='causal_graph',
                      iters=config.total_epoch)
 
@@ -432,12 +441,18 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
 
     print(f'Training CUTS+ on {train_data.shape[0]} timesteps across {len(train_ids)} sessions '
           f'({n_nodes} variables) using device={device}')
+
+    def plot_epoch_graph(epoch_i, raw_graph):
+        if (epoch_i + 1) % config.graph_plot_every == 0:
+            log.log_figures(plot_labeled_adjacency(raw_graph.T, channel_names), name='causal_graph',
+                             iters=epoch_i + 1)
+
     multicad = MultiCAD(opt, log, device=device)
     train_norm = normalize(train_data)
     # true_cm=None (no ground truth) - so, unlike run_pipeline, the graph MultiCAD.train() returns is
     # NOT auto-transposed into "row=effect, col=cause" convention. Transpose it ourselves below.
     graph = multicad.train(train_norm[:, :, None], train_mask[:, :, None], train_norm[:, :, None],
-                            true_cm=None)
+                            true_cm=None, epoch_callback=plot_epoch_graph)
     graph = graph.T
 
     log.log_figures(plot_labeled_adjacency(graph, channel_names), name='causal_graph',

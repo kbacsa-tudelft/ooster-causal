@@ -1,13 +1,17 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Two deliberate deviations from upstream, both performance-only (same math, same
-# results, no behavior change) - kept as the only edits so this stays otherwise faithful to the source:
+# see ../LICENSE). Three deliberate deviations from upstream, kept as the only edits so this stays
+# otherwise faithful to the source:
 #   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
 #      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
 #      real CLI entry point lives in the parent UNN repo.
-#   2. batch_generater's per-sample Python loop was vectorized, and MultiCAD.train()'s per-batch
-#      `.item()` calls (each a blocking CPU/GPU sync) were deduplicated and rate-limited to every
-#      LOG_EVERY_N_BATCHES batches instead of every batch - see LOG_EVERY_N_BATCHES below. Both were
-#      identified as the cause of low GPU utilization on real hardware.
+#   2. Performance-only (same math, same results, no behavior change): batch_generater's per-sample
+#      Python loop was vectorized, and MultiCAD.train()'s per-batch `.item()` calls (each a blocking
+#      CPU/GPU sync) were deduplicated and rate-limited to every LOG_EVERY_N_BATCHES batches instead
+#      of every batch - see LOG_EVERY_N_BATCHES below. Both were identified as the cause of low GPU
+#      utilization on real hardware.
+#   3. MultiCAD.train() gained an optional `epoch_callback` parameter (default None, so any existing
+#      caller is unaffected) invoked once per epoch with the current graph - lets a caller plot it
+#      periodically without touching this training loop.
 
 import logging
 import os, sys
@@ -217,7 +221,11 @@ class MultiCAD(object):
 
 
 
-    def train(self, data, observ_mask, original_data, true_cm=None):
+    def train(self, data, observ_mask, original_data, true_cm=None, epoch_callback=None):
+        # perf patch note above covers deviations 1-2; this optional epoch_callback param is a third,
+        # purely additive one: defaults to None (no-op, unchanged behavior for any existing caller),
+        # invoked as epoch_callback(epoch_i, Graph) once per epoch with the raw (untransposed,
+        # source->target) graph, so a caller can e.g. plot it periodically without modifying this loop.
 
         original_data = torch.from_numpy(original_data).float().to(self.device)
         observ_mask = torch.from_numpy(observ_mask).float().to(self.device)
@@ -374,6 +382,8 @@ class MultiCAD(object):
             GT_prob = self.GT.detach().cpu().numpy()
             Graph = np.einsum("nm,ml->nl", G_prob, GT_prob)
 
+            if epoch_callback is not None:
+                epoch_callback(epoch_i, Graph)
 
             if (epoch_i+1) % self.args.show_graph_every == 0:
                 avg_mask = np.mean(observ_mask.cpu().numpy(), axis=(0,2))
