@@ -291,14 +291,17 @@ def causal_discovery_eval(graph: np.ndarray, causal_struct_value: np.ndarray, ca
     return {'auroc': auroc, 'auprc': auprc, 'f1': f1, 'hamming': hamming}
 
 
-def plot_labeled_adjacency(graph: np.ndarray, channel_names: list):
+def plot_labeled_adjacency(graph: np.ndarray, channel_names: list, dpi: int = 300):
     """Heatmap of the discovered causal adjacency matrix (rows=effect, cols=cause) with channel
-    names as axis tick labels, for logging to TensorBoard."""
+    names as axis tick labels, for logging to TensorBoard. Sized and rendered so labels stay
+    legible even at ~100+ channels: figure size scales with channel count (not capped small),
+    font size has a readable floor rather than shrinking to near-illegibility, and dpi is bumped
+    well above matplotlib's 100dpi default."""
     n = graph.shape[0]
-    side = max(6.0, min(30.0, n * 0.3))
-    fig, ax = plt.subplots(figsize=(side, side))
+    side = max(8.0, n * 0.18)  # inches - grows with channel count instead of capping out
+    fig, ax = plt.subplots(figsize=(side, side), dpi=dpi, layout='constrained')
     im = ax.imshow(graph, cmap='magma', vmin=float(np.min(graph)), vmax=float(np.max(graph)))
-    tick_fontsize = max(4, min(9, int(300 / max(n, 1))))
+    tick_fontsize = max(7, min(11, 1400 / max(n, 1)))  # floor of 7pt - readable, not the old 4pt floor
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
     ax.set_xticklabels(channel_names, rotation=90, fontsize=tick_fontsize)
@@ -307,7 +310,6 @@ def plot_labeled_adjacency(graph: np.ndarray, channel_names: list):
     ax.set_ylabel('effect')
     ax.set_title('Discovered causal adjacency (effect <- cause)')
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    fig.tight_layout()
     return fig
 
 
