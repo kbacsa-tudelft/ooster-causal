@@ -18,6 +18,7 @@ import os
 import sys
 from dataclasses import dataclass, fields
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -289,6 +290,26 @@ def causal_discovery_eval(graph: np.ndarray, causal_struct_value: np.ndarray, ca
     return {'auroc': auroc, 'auprc': auprc, 'f1': f1, 'hamming': hamming}
 
 
+def plot_labeled_adjacency(graph: np.ndarray, channel_names: list):
+    """Heatmap of the discovered causal adjacency matrix (rows=effect, cols=cause) with channel
+    names as axis tick labels, for logging to TensorBoard."""
+    n = graph.shape[0]
+    side = max(6.0, min(30.0, n * 0.3))
+    fig, ax = plt.subplots(figsize=(side, side))
+    im = ax.imshow(graph, cmap='magma', vmin=float(np.min(graph)), vmax=float(np.max(graph)))
+    tick_fontsize = max(4, min(9, int(300 / max(n, 1))))
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(channel_names, rotation=90, fontsize=tick_fontsize)
+    ax.set_yticklabels(channel_names, fontsize=tick_fontsize)
+    ax.set_xlabel('cause')
+    ax.set_ylabel('effect')
+    ax.set_title('Discovered causal adjacency (effect <- cause)')
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    return fig
+
+
 def run_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_plus_rca'):
     """Runs the full train -> causal-discovery-eval -> root-cause-analysis pipeline and returns
     (multicad, graph, causal_metrics, rc_metrics). Separated from main() so tests can call it
@@ -320,6 +341,10 @@ def run_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_plus_rca')
     train_mask = np.ones_like(train_norm)
     graph = multicad.train(train_norm[:, :, None], train_mask[:, :, None], train_norm[:, :, None],
                             true_cm=causal_struct_value)
+
+    channel_names = [f'var_{i}' for i in range(n_nodes)]
+    log.log_figures(plot_labeled_adjacency(graph, channel_names), name='causal_graph',
+                     iters=config.total_epoch)
 
     print('=' * 50)
     causal_metrics = causal_discovery_eval(graph, causal_struct_value, config.causal_quantile)
@@ -414,6 +439,9 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     graph = multicad.train(train_norm[:, :, None], train_mask[:, :, None], train_norm[:, :, None],
                             true_cm=None)
     graph = graph.T
+
+    log.log_figures(plot_labeled_adjacency(graph, channel_names), name='causal_graph',
+                     iters=config.total_epoch)
 
     val_residuals = np.concatenate([
         predict_residuals(multicad, normalize(series_dict[vid].values.astype(np.float32)), device)
