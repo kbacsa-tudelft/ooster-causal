@@ -55,7 +55,7 @@ class CUTSPlusRCAConfig:
     total_epoch: int = 30
     lr_data_start: float = 1e-2
     lr_data_end: float = 1e-3
-    weight_decay: float = 0.0
+    weight_decay: float = 1e-4  # L2 regularization on the predictor (fitting_model), via Adam's weight_decay
     lr_graph_start: float = 1e-3
     lr_graph_end: float = 1e-4
     lambda_s_start: float = 1e-1
