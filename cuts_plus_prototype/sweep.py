@@ -27,6 +27,13 @@ import sys
 import time
 from dataclasses import fields
 
+# Under `nohup ... > sweep.log &`, stdout is redirected to a file, so Python switches from
+# line-buffered to fully-buffered (~8KB) - a short sweep like "Sweeping N combinations..." can sit
+# unflushed for a long time even though everything is actually running fine. Force line buffering so
+# progress is visible in the log immediately.
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cuts_plus_rca import CUTSPlusRCAConfig, build_arg_parser  # noqa: E402
 
@@ -106,7 +113,8 @@ def main():
         print(f'\n=== [{i}/{len(combos)}] {name} ===')
         start = time.time()
         with open(log_path, 'w') as f:
-            proc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
+            proc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT,
+                                   env={**os.environ, 'PYTHONUNBUFFERED': '1'})
         elapsed = time.time() - start
 
         ok = proc.returncode == 0
