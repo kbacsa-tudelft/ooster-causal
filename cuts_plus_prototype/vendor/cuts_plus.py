@@ -1,5 +1,5 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Three deliberate deviations from upstream, kept as the only edits so this stays
+# see ../LICENSE). Four deliberate deviations from upstream, kept as the only edits so this stays
 # otherwise faithful to the source:
 #   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
 #      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
@@ -12,6 +12,14 @@
 #   3. MultiCAD.train() gained an optional `epoch_callback` parameter (default None, so any existing
 #      caller is unaffected) invoked once per epoch with the current graph - lets a caller plot it
 #      periodically without touching this training loop.
+#   4. Bug fix: the end-of-epoch `Graph` computed for plot_matrix/calc_and_log_metrics/the returned
+#      value used the raw `self.GT` parameter (an unconstrained logit, can be negative) instead of
+#      `torch.sigmoid(self.GT)` - the version actually used everywhere else in this file (the S1/S2
+#      training forward passes, which require a [0,1] probability for torch.bernoulli/gumbel_softmax
+#      sampling to be well-defined). This made every plotted/saved/returned Graph a raw logit rather
+#      than an edge probability - harmless to rank-based metrics (AUROC/AUPRC, quantile-based
+#      binarization) since sigmoid is monotonic, but confusing to read directly (negative values look
+#      like "inverse causation" when they just mean "logit < 0, i.e. probability < 0.5").
 
 import logging
 import os, sys
@@ -379,7 +387,7 @@ class MultiCAD(object):
             plot_roc = False
 
             G_prob = self.G.detach().cpu().numpy()
-            GT_prob = self.GT.detach().cpu().numpy()
+            GT_prob = torch.sigmoid(self.GT).detach().cpu().numpy()  # see deviation 4 in header comment
             Graph = np.einsum("nm,ml->nl", G_prob, GT_prob)
 
             if epoch_callback is not None:
