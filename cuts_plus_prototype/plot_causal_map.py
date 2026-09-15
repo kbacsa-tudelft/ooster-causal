@@ -67,7 +67,9 @@ def load_locations(locations_csv: str, channel_names: list, rain_shift_m: float)
 
 def strongest_edges(graph: np.ndarray, channel_names: list, coords: dict, top_k: int) -> list:
     """Returns [(weight, effect_name, cause_name), ...], strongest first, restricted to edges
-    where both endpoints have a known location."""
+    where both endpoints have a known location and the effect is a WL_* (water-level) channel -
+    a WL_* or RH_* cause's effect on rainfall isn't the physically interesting relationship here,
+    so RH_* is never shown as an effect."""
     edge_strength = graph.copy()
     np.fill_diagonal(edge_strength, 0.0)
     n = len(channel_names)
@@ -77,6 +79,8 @@ def strongest_edges(graph: np.ndarray, channel_names: list, coords: dict, top_k:
             if i == j:
                 continue
             effect, cause = channel_names[i], channel_names[j]
+            if not effect.startswith('WL_'):
+                continue
             if effect in coords and cause in coords:
                 pairs.append((edge_strength[i, j], effect, cause))
     pairs.sort(key=lambda p: p[0], reverse=True)
@@ -85,10 +89,10 @@ def strongest_edges(graph: np.ndarray, channel_names: list, coords: dict, top_k:
 
 def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict) -> list:
     """For each node acting as a cause (source), keeps only its single strongest outgoing edge (to
-    whichever effect it influences most). For an RH_* (rainfall) source, only WL_* (water-level)
-    effects are considered - a rain gauge's strongest link to another rain gauge isn't the
-    physically interesting relationship here. Returns [(weight, effect_name, cause_name), ...],
-    strongest first - at most one entry per located source node."""
+    whichever effect it influences most). Only WL_* (water-level) effects are considered, regardless
+    of the source's type - a cause's effect on rainfall isn't the physically interesting
+    relationship here. Returns [(weight, effect_name, cause_name), ...], strongest first - at most
+    one entry per located source node."""
     edge_strength = graph.copy()
     np.fill_diagonal(edge_strength, 0.0)
     n = len(channel_names)
@@ -97,7 +101,6 @@ def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: 
         cause = channel_names[j]
         if cause not in coords:
             continue
-        is_rain = cause.startswith('RH_')
         best_i, best_w = None, -np.inf
         for i in range(n):
             if i == j:
@@ -105,8 +108,8 @@ def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: 
             effect = channel_names[i]
             if effect not in coords:
                 continue
-            if is_rain and effect.startswith('RH_'):
-                continue  # rain source: only consider water-level effects
+            if not effect.startswith('WL_'):
+                continue  # only consider water-level effects
             if edge_strength[i, j] > best_w:
                 best_i, best_w = i, edge_strength[i, j]
         if best_i is not None:
@@ -117,10 +120,9 @@ def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: 
 
 def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict, top_n: int) -> dict:
     """For each node acting as a cause (source), its top_n strongest outgoing edges (to other
-    located nodes). For an RH_* (rainfall) source, only WL_* (water-level) effects are considered -
-    a rain gauge's strongest link to another rain gauge isn't the physically interesting
-    relationship here (same restriction as strongest_outgoing_per_node, generalized to top_n).
-    Returns {cause_name: [(effect_name, weight), ...]}, strongest first."""
+    located nodes). Only WL_* (water-level) effects are considered, regardless of the source's type
+    (same restriction as strongest_outgoing_per_node, generalized to top_n). Returns
+    {cause_name: [(effect_name, weight), ...]}, strongest first."""
     edge_strength = graph.copy()
     np.fill_diagonal(edge_strength, 0.0)
     n = len(channel_names)
@@ -129,7 +131,6 @@ def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict
         cause = channel_names[j]
         if cause not in coords:
             continue
-        is_rain = cause.startswith('RH_')
         candidates = []
         for i in range(n):
             if i == j:
@@ -137,7 +138,7 @@ def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict
             effect = channel_names[i]
             if effect not in coords:
                 continue
-            if is_rain and effect.startswith('RH_'):
+            if not effect.startswith('WL_'):
                 continue
             candidates.append((edge_strength[i, j], effect))
         candidates.sort(reverse=True)
