@@ -155,17 +155,30 @@ def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coord
     marker_vars = []
     for name, (lat, lon) in coords.items():
         is_rain = name.startswith('RH_')
-        marker = folium.CircleMarker(
+        color = 'steelblue' if is_rain else 'darkred'
+        folium.CircleMarker(
             location=[lat, lon],
-            radius=13,
-            color='steelblue' if is_rain else 'darkred',
+            radius=8,
+            color=color,
             fill=True,
             fill_opacity=0.9,
+        ).add_to(m)
+        # Invisible padding ring, larger than the visible dot - the actual hover target, so the
+        # cursor landing near the small dot's edge doesn't flicker in/out of the hit area. fill_opacity
+        # just above 0 (rather than exactly 0) keeps it reliably hit-testable across browsers.
+        hit_marker = folium.CircleMarker(
+            location=[lat, lon],
+            radius=16,
+            color=color,
+            weight=0,
+            opacity=0,
+            fill=True,
+            fill_opacity=0.02,
             popup=name,
             tooltip=name,
         )
-        marker.add_to(m)
-        marker_vars.append((marker.get_name(), name))
+        hit_marker.add_to(m)
+        marker_vars.append((hit_marker.get_name(), name))
 
     node_coords_json = json.dumps({n: [lat, lon] for n, (lat, lon) in coords.items()})
     top_edges_json = json.dumps(top_edges)
