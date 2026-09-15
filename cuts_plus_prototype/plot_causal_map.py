@@ -157,7 +157,7 @@ def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coord
         is_rain = name.startswith('RH_')
         marker = folium.CircleMarker(
             location=[lat, lon],
-            radius=8,
+            radius=13,
             color='steelblue' if is_rain else 'darkred',
             fill=True,
             fill_opacity=0.9,
