@@ -176,7 +176,11 @@ def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coord
 @keyframes causal_dash {{ to {{ stroke-dashoffset: -16; }} }}
 </style>
 <script>
-(function() {{
+window.addEventListener('load', function() {{
+    // Deferred to 'load' because folium/branca emits its own map/marker init scripts into the
+    // document's script section at render time, in an order this element's position can't control -
+    // referencing {m.get_name()} synchronously here can run before that code has executed. 'load'
+    // fires only after everything else on the page has already run, so this is always safe.
     var map = {m.get_name()};
     var nodeCoords = {node_coords_json};
     var topEdges = {top_edges_json};
@@ -215,7 +219,7 @@ def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coord
             f"showLinks({json.dumps(name)}, {json.dumps(color)}); }});\n"
             f"    {marker_var}.on('mouseout', clearLines);\n"
         )
-    script_lines.append('})();\n</script>\n')
+    script_lines.append('});\n</script>\n')
 
     m.get_root().html.add_child(folium.Element(''.join(script_lines)))
     print(f'Wrote hover map: {len(coords)} nodes, up to {top_n} outgoing edges shown per hover')
