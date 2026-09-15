@@ -14,6 +14,7 @@ Run:
         --synthetic-series-len 600
 """
 import argparse
+import json
 import os
 import sys
 from dataclasses import dataclass, fields
@@ -589,6 +590,10 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     np.save(os.path.join(save_dir, 'cuts_plus_residual_median.npy'), median)
     np.save(os.path.join(save_dir, 'cuts_plus_residual_std.npy'), std)
     np.save(os.path.join(save_dir, 'cuts_plus_pot_thresholds.npy'), pot_thresholds)
+    # channel_names may differ from the dataset's raw column list (see the fully_missing drop above),
+    # so the graph's row/column order can't always be recovered from the dataset alone.
+    with open(os.path.join(save_dir, 'channel_names.json'), 'w') as fh:
+        json.dump(channel_names, fh, indent=2)
 
     log.close()
     return multicad, graph

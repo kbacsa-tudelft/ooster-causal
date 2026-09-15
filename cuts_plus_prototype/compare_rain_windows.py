@@ -25,6 +25,7 @@ Usage:
 """
 import argparse
 import glob
+import json
 import os
 from collections import Counter
 
@@ -32,7 +33,15 @@ import numpy as np
 import pandas as pd
 
 
-def load_channel_names(data_dir: str) -> list:
+def load_channel_names(data_dir: str, graph_path: str) -> list:
+    """Prefers the channel_names.json cuts_plus_rca.py saves next to the graph - the training
+    pipeline can drop zero-observation channels, so the graph's row/column order doesn't always
+    match the dataset's raw column list. Falls back to the dataset's columns for older runs that
+    predate this file."""
+    names_path = os.path.join(os.path.dirname(graph_path), 'channel_names.json')
+    if os.path.exists(names_path):
+        with open(names_path) as fh:
+            return json.load(fh)
     f = sorted(glob.glob(os.path.join(data_dir, '*.parquet')))[0]
     return list(pd.read_parquet(f).columns)
 
@@ -67,7 +76,7 @@ def main():
     for w in args.windows:
         data_dir = args.data_dir_template.format(w=w)
         graph_path = args.graph_template.format(w=w)
-        channel_names = load_channel_names(data_dir)
+        channel_names = load_channel_names(data_dir, graph_path)
         graph = np.load(graph_path)
         edges = rain_edges(graph, channel_names)
         weights = np.array([e[0] for e in edges])
