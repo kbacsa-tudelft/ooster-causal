@@ -76,3 +76,5 @@ torch
 tensorboard
 pillow
 plotly
+folium
+pyproj

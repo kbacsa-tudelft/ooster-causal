@@ -154,14 +154,23 @@ def load_real_sessions(data_dir: str):
 
 def concat_sessions(series_dict: dict, session_ids: list, boundary_gap: int):
     """Concatenates session DataFrames (in session_ids order) into one (T, N) array + an observ_mask
-    that zeroes out the first `boundary_gap` timesteps of every session after the first, so CUTS+
-    (which natively supports missing/masked data) never trains on a window whose input reaches back
-    into a different, unrelated session."""
-    arrays = [series_dict[sid].values.astype(np.float32) for sid in session_ids]
-    data = np.concatenate(arrays, axis=0)
-    mask = np.ones_like(data)
+    that is 0 wherever the source data was NaN (real missing readings) and additionally 0 for the
+    first `boundary_gap` timesteps of every session after the first, so CUTS+ (which natively
+    supports missing/masked data) never trains on a window whose input reaches back into a different,
+    unrelated session.
+
+    Missing values are forward-filled (zero-order hold, matching CUTS+'s own recommended imputation
+    strategy) independently per session, before concatenation - so a fill never bleeds from one
+    session into the next. A session's leading NaN (before its first real observation) can't be
+    forward-filled and is left as NaN - callers should still run fill_missing (e.g. with the training
+    mean) as a fallback for that case, since the mask only excludes points from the loss, it doesn't
+    stop NaN propagating through the forward pass."""
+    raw_arrays = [series_dict[sid].values.astype(np.float32) for sid in session_ids]
+    filled_arrays = [series_dict[sid].ffill().values.astype(np.float32) for sid in session_ids]
+    data = np.concatenate(filled_arrays, axis=0)
+    mask = (~np.isnan(np.concatenate(raw_arrays, axis=0))).astype(np.float32)
     offset = 0
-    for arr in arrays[:-1]:
+    for arr in raw_arrays[:-1]:
         offset += arr.shape[0]
         mask[offset:offset + boundary_gap] = 0.0
     return data, mask
@@ -200,14 +209,19 @@ def build_opt(config: CUTSPlusRCAConfig, n_nodes: int):
     })
 
 
-def predict_residuals(multicad: MultiCAD, data: np.ndarray, device) -> np.ndarray:
+def predict_residuals(multicad: MultiCAD, data: np.ndarray, device, mask: np.ndarray = None):
     """One-step-ahead prediction residuals (actual - predicted) for every valid window in `data`,
     using the trained fitting_model and its current learned graph, in time order. `data` is 2D
-    (T, N), already normalized the same way the training data was."""
+    (T, N), already normalized the same way the training data was. `mask` (T, N), 1=observed,
+    0=missing/imputed - defaults to all-observed. Returns (residuals, observed), where `observed`
+    is the target-side mask aligned the same way as `residuals`, so callers can exclude residuals
+    computed against imputed (never actually observed) values."""
     n_nodes = data.shape[1]
     input_step = multicad.args.input_step
+    if mask is None:
+        mask = np.ones_like(data)
     data3 = data[:, :, None]
-    mask3 = np.ones_like(data3)
+    mask3 = mask[:, :, None]
     data_t = torch.from_numpy(data3).float().to(device)
     mask_t = torch.from_numpy(mask3).float().to(device)
 
@@ -227,12 +241,41 @@ def predict_residuals(multicad: MultiCAD, data: np.ndarray, device) -> np.ndarra
         y_pred = multicad.fitting_model(x, mask_x, graph_expanded)
 
     residual = (y - y_pred).squeeze(-1).squeeze(-1).cpu().numpy()
+    observed = mask_y.squeeze(-1).squeeze(-1).cpu().numpy()
     order = np.argsort(t_idx.cpu().numpy())
-    return residual[order]
+    return residual[order], observed[order]
 
 
-def fit_residual_thresholds(residuals: np.ndarray):
-    return np.median(residuals, axis=0), np.std(residuals, axis=0)
+def session_data_and_mask(df):
+    """Forward-fills one session's DataFrame (zero-order hold) and returns (filled_values, mask),
+    where mask is 1 wherever the *original* (pre-fill) value was real - mirrors concat_sessions'
+    per-session handling, for the single-session case (validation/scoring)."""
+    raw = df.values.astype(np.float32)
+    filled = df.ffill().values.astype(np.float32)
+    mask = (~np.isnan(raw)).astype(np.float32)
+    return filled, mask
+
+
+def fill_missing(data: np.ndarray, fill_values: np.ndarray) -> np.ndarray:
+    """Fallback fill for whatever NaN survives forward-filling (a session's leading gap, before its
+    first real observation, can't be forward-filled). Replaces NaN in `data` (T, N) with the
+    per-column `fill_values` (N,) - e.g. the training mean, so a masked position becomes exactly 0
+    once normalized against that same mean."""
+    return np.where(np.isnan(data), fill_values[None, :], data)
+
+
+def fit_residual_thresholds(residuals: np.ndarray, observed: np.ndarray = None):
+    """Per-column median/std of residuals. If `observed` (same shape, 1=observed) is given, only
+    residuals computed against genuinely-observed values are used."""
+    if observed is None:
+        return np.median(residuals, axis=0), np.std(residuals, axis=0)
+    median = np.full(residuals.shape[1], np.nan)
+    std = np.full(residuals.shape[1], np.nan)
+    for c in range(residuals.shape[1]):
+        col = residuals[observed[:, c] > 0, c]
+        median[c] = np.median(col)
+        std[c] = np.std(col)
+    return median, std
 
 
 def root_cause_analysis(residuals_test, labels_test, median, std, risk, initial_level, num_candidates,
@@ -260,26 +303,37 @@ def root_cause_analysis(residuals_test, labels_test, median, std, risk, initial_
     }
 
 
-def fit_pot_thresholds(z_scores_val: np.ndarray, risk, initial_level, num_candidates):
+def fit_pot_thresholds(z_scores_val: np.ndarray, risk, initial_level, num_candidates,
+                        observed: np.ndarray = None, min_observed: int = 50):
     """Unsupervised: fits a per-variable POT/EVT threshold from a validation (known-normal) z-score
     distribution. Unlike root_cause_analysis (which mirrors AERCA's benchmark convention of fitting
     POT on the evaluation window itself), this fits on held-out normal data and is meant to be
-    applied to new data afterwards - the right shape for real deployment with no labels."""
-    return np.array([
-        pot(z_scores_val[:, i], risk, initial_level, num_candidates)[0]
-        for i in range(z_scores_val.shape[1])
-    ])
+    applied to new data afterwards - the right shape for real deployment with no labels. If
+    `observed` is given, only genuinely-observed z-scores are used per column - a column with fewer
+    than `min_observed` of those (not enough for a meaningful tail fit; pot() can crash on very small
+    samples) gets threshold=NaN, which score_session/flags treats as "never flags" rather than
+    crashing (a channel with almost no validation data can't have anomalies meaningfully detected)."""
+    thresholds = np.full(z_scores_val.shape[1], np.nan)
+    for i in range(z_scores_val.shape[1]):
+        col = z_scores_val[observed[:, i] > 0, i] if observed is not None else z_scores_val[:, i]
+        if len(col) < min_observed:
+            continue
+        thresholds[i] = pot(col, risk, initial_level, num_candidates)[0]
+    return thresholds
 
 
-def score_session(multicad: MultiCAD, data_2d: np.ndarray, median, std, pot_thresholds, device):
+def score_session(multicad: MultiCAD, data_2d: np.ndarray, median, std, pot_thresholds, device,
+                   mask: np.ndarray = None):
     """Scores one (already-normalized) session against thresholds fit on validation data. Returns
-    (z_scores, flags) with flags[t, i] True where variable i's residual at time t exceeds its POT
-    threshold - i.e. a candidate anomaly, with no label to check it against."""
-    residuals = predict_residuals(multicad, data_2d, device)
+    (z_scores, flags, observed) with flags[t, i] True where variable i's residual at time t exceeds
+    its POT threshold - i.e. a candidate anomaly, with no label to check it against. `observed[t, i]`
+    is 1 where that position was a real (not imputed) reading - callers should ignore flags/z_scores
+    where observed is 0."""
+    residuals, observed = predict_residuals(multicad, data_2d, device, mask=mask)
     std_safe = np.where(std == 0, 1e-8, std)
     z_scores = (residuals - median) / std_safe
     flags = z_scores > pot_thresholds[None, :]
-    return z_scores, flags
+    return z_scores, flags, observed
 
 
 def causal_discovery_eval(graph: np.ndarray, causal_struct_value: np.ndarray, causal_quantile: float):
@@ -366,10 +420,10 @@ def run_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_plus_rca')
     for k, v in causal_metrics.items():
         log.log_metrics({f'test/causal_{k}': float(v)}, config.total_epoch)
 
-    val_residuals = predict_residuals(multicad, normalize(val_data), device)
+    val_residuals, _ = predict_residuals(multicad, normalize(val_data), device)
     median, std = fit_residual_thresholds(val_residuals)
 
-    test_residuals = predict_residuals(multicad, normalize(test_data), device)
+    test_residuals, _ = predict_residuals(multicad, normalize(test_data), device)
     rc_metrics = root_cause_analysis(test_residuals, test_labels, median, std,
                                       config.risk, config.initial_level, config.num_candidates,
                                       config.input_step)
@@ -423,23 +477,46 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
           f'(out of {len(session_ids)} total)')
 
     channel_names = list(series_dict[session_ids[0]].columns)
-    n_nodes = len(channel_names)
 
     train_data, train_mask = concat_sessions(series_dict, train_ids, boundary_gap=config.input_step)
+
+    # A channel with zero real observations across all training sessions has no train_mean, so
+    # fill_missing can't fill it (NaN stays NaN), which poisons the whole network's gradients within
+    # a step or two. Drop any such channel entirely - nothing can be learned about (or from) it if
+    # training never observed it once.
+    fully_missing = train_mask.sum(axis=0) == 0
+    if fully_missing.any():
+        dropped = [c for c, drop in zip(channel_names, fully_missing) if drop]
+        print(f'Dropping {len(dropped)} channel(s) with zero observations across all training '
+              f'sessions: {dropped}')
+        channel_names = [c for c, drop in zip(channel_names, fully_missing) if not drop]
+        train_data = train_data[:, ~fully_missing]
+        train_mask = train_mask[:, ~fully_missing]
+
+    n_nodes = len(channel_names)
+    boundary_cells = config.input_step * n_nodes * (len(train_ids) - 1)
+    n_missing = (train_mask == 0).sum() - boundary_cells  # exclude boundary gaps, count only real NaN
+    if n_missing > 0:
+        print(f'{n_missing} / {train_data.size} training values are missing (NaN) - masked out of '
+              f'training and filled with each channel\'s mean.')
 
     if means is not None and stds is not None:
         train_mean = means.reindex(channel_names).values.astype(np.float32)
         train_std = stds.reindex(channel_names).values.astype(np.float32)
     else:
-        train_mean, train_std = train_data.mean(axis=0), train_data.std(axis=0)
+        # nanmean/nanstd: train_data still has real NaN in it here, not yet filled.
+        train_mean, train_std = np.nanmean(train_data, axis=0), np.nanstd(train_data, axis=0)
     train_std_safe = np.where(train_std == 0, 1.0, train_std)
 
     def normalize(d):
-        return (d - train_mean) / train_std_safe
+        return (fill_missing(d, train_mean) - train_mean) / train_std_safe
 
     opt = build_opt(config, n_nodes)
     log = MyLogger(log_dir=os.path.join(os.getcwd(), config.log_dir, log_dir_name),
                     stdout=False, stderr=False, tensorboard=True)
+    log.log_metrics({'data/n_channels_dropped': int(fully_missing.sum()),
+                      'data/n_channels_used': n_nodes,
+                      'data/train_missing_fraction': float(n_missing / train_data.size)}, 0)
 
     print(f'Training CUTS+ on {train_data.shape[0]} timesteps across {len(train_ids)} sessions '
           f'({n_nodes} variables) using device={device}')
@@ -460,13 +537,20 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     log.log_figures(plot_labeled_adjacency(graph, channel_names), name='causal_graph',
                      iters=config.total_epoch)
 
-    val_residuals = np.concatenate([
-        predict_residuals(multicad, normalize(series_dict[vid].values.astype(np.float32)), device)
-        for vid in val_ids
-    ], axis=0)
-    median, std = fit_residual_thresholds(val_residuals)
+    val_pairs = []
+    for vid in val_ids:
+        filled, mask = session_data_and_mask(series_dict[vid][channel_names])
+        val_pairs.append(predict_residuals(multicad, normalize(filled), device, mask=mask))
+    val_residuals = np.concatenate([r for r, _ in val_pairs], axis=0)
+    val_observed = np.concatenate([o for _, o in val_pairs], axis=0)
+    median, std = fit_residual_thresholds(val_residuals, observed=val_observed)
     val_z = (val_residuals - median) / np.where(std == 0, 1e-8, std)
-    pot_thresholds = fit_pot_thresholds(val_z, config.risk, config.initial_level, config.num_candidates)
+    pot_thresholds = fit_pot_thresholds(val_z, config.risk, config.initial_level, config.num_candidates,
+                                         observed=val_observed)
+    unscoreable = [c for c, t in zip(channel_names, pot_thresholds) if np.isnan(t)]
+    if unscoreable:
+        print(f'{len(unscoreable)} channel(s) have too little validation data to set an anomaly '
+              f'threshold, so they will never be flagged: {unscoreable}')
 
     save_dir = os.path.join(os.getcwd(), config.save_dir)
     os.makedirs(save_dir, exist_ok=True)
@@ -474,16 +558,22 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     print('=' * 50)
     print('Scoring held-out sessions (no ground truth - reporting flagged fractions, not accuracy):')
     for sid in score_ids:
-        data = series_dict[sid].values.astype(np.float32)
-        z_scores, flags = score_session(multicad, normalize(data), median, std, pot_thresholds, device)
-        flagged_fraction = flags.mean()
-        per_var_fraction = flags.mean(axis=0)
-        top_vars = np.argsort(per_var_fraction)[::-1][:5]
+        filled, mask = session_data_and_mask(series_dict[sid][channel_names])
+        z_scores, flags, observed = score_session(multicad, normalize(filled), median, std, pot_thresholds,
+                                                    device, mask=mask)
+        flagged_fraction = flags[observed > 0].mean() if observed.sum() > 0 else float('nan')
+        per_var_fraction = np.array([
+            flags[observed[:, c] > 0, c].mean() if observed[:, c].sum() > 0 else np.nan
+            for c in range(flags.shape[1])
+        ])
+        top_vars = np.argsort(np.nan_to_num(per_var_fraction, nan=-1))[::-1][:5]
         top_str = ', '.join(f'{channel_names[i]} ({per_var_fraction[i] * 100:.1f}%)' for i in top_vars)
-        print(f'  {sid}: {flagged_fraction * 100:.2f}% of (timestep, variable) pairs flagged; '
+        print(f'  {sid}: {flagged_fraction * 100:.2f}% of observed (timestep, variable) pairs flagged; '
               f'most-flagged: {top_str}')
+        log.log_metrics({f'test/score_{sid}_flagged_fraction': float(flagged_fraction)}, config.total_epoch)
         np.save(os.path.join(save_dir, f'cuts_plus_score_{sid}_z.npy'), z_scores)
         np.save(os.path.join(save_dir, f'cuts_plus_score_{sid}_flags.npy'), flags)
+        np.save(os.path.join(save_dir, f'cuts_plus_score_{sid}_observed.npy'), observed)
 
     edge_strength = graph.copy()
     np.fill_diagonal(edge_strength, 0.0)

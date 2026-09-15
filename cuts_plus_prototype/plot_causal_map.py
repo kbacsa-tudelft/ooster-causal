@@ -1,0 +1,189 @@
+"""
+Plots the discovered causal graph on a folium map using real station coordinates from
+locations.csv (EPSG:28992, Dutch RD). Nodes = channels with known coordinates; arrows = causal
+edges (effect <- cause), thicker/darker for stronger edges. Rainfall (RH_*) stations are shifted
+northward so they visually sit "above" the water-level network, since their real location isn't
+otherwise distinguishable on the map from a water-level sensor.
+
+Channels missing from locations.csv (and any edge touching one) are skipped and reported - not
+silently dropped.
+
+Usage:
+    python3 cuts_plus_prototype/plot_causal_map.py \
+        --graph cuts_plus_prototype/scratch/full_run_v3/models/cuts_plus_graph.npy \
+        --data-dir two_week_chunks_full \
+        --output causal_map.html
+"""
+import argparse
+import glob
+import os
+
+import folium
+import numpy as np
+import pandas as pd
+from folium.plugins import PolyLineTextPath
+from pyproj import Transformer
+
+
+def load_channel_names(data_dir: str) -> list:
+    f = sorted(glob.glob(os.path.join(data_dir, '*.parquet')))[0]
+    return list(pd.read_parquet(f).columns)
+
+
+def load_locations(locations_csv: str, channel_names: list, rain_shift_m: float) -> dict:
+    """Maps channel name -> (lat, lon), converting from EPSG:28992 and shifting RH_* stations
+    `rain_shift_m` meters north (in the original projected CRS, so the shift is a true distance)
+    before converting to lat/lon. locations.csv drops the "WL_" prefix that water-level channels
+    have in the data; RH_* names match directly."""
+    locs = pd.read_csv(locations_csv).set_index('name')
+    transformer = Transformer.from_crs('EPSG:28992', 'EPSG:4326', always_xy=True)
+
+    coords = {}
+    for c in channel_names:
+        stripped = c[len('WL_'):] if c.startswith('WL_') else c
+        if stripped not in locs.index:
+            continue
+        x, y = float(locs.loc[stripped, 'x']), float(locs.loc[stripped, 'y'])
+        if c.startswith('RH_'):
+            y = y + rain_shift_m
+        lon, lat = transformer.transform(x, y)
+        coords[c] = (float(lat), float(lon))  # plain floats: folium/branca JSON-serializes these
+    return coords
+
+
+def strongest_edges(graph: np.ndarray, channel_names: list, coords: dict, top_k: int) -> list:
+    """Returns [(weight, effect_name, cause_name), ...], strongest first, restricted to edges
+    where both endpoints have a known location."""
+    edge_strength = graph.copy()
+    np.fill_diagonal(edge_strength, 0.0)
+    n = len(channel_names)
+    pairs = []
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            effect, cause = channel_names[i], channel_names[j]
+            if effect in coords and cause in coords:
+                pairs.append((edge_strength[i, j], effect, cause))
+    pairs.sort(key=lambda p: p[0], reverse=True)
+    return pairs[:top_k]
+
+
+def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict) -> list:
+    """For each node acting as a cause (source), keeps only its single strongest outgoing edge (to
+    whichever effect it influences most). For an RH_* (rainfall) source, only WL_* (water-level)
+    effects are considered - a rain gauge's strongest link to another rain gauge isn't the
+    physically interesting relationship here. Returns [(weight, effect_name, cause_name), ...],
+    strongest first - at most one entry per located source node."""
+    edge_strength = graph.copy()
+    np.fill_diagonal(edge_strength, 0.0)
+    n = len(channel_names)
+    pairs = []
+    for j in range(n):
+        cause = channel_names[j]
+        if cause not in coords:
+            continue
+        is_rain = cause.startswith('RH_')
+        best_i, best_w = None, -np.inf
+        for i in range(n):
+            if i == j:
+                continue
+            effect = channel_names[i]
+            if effect not in coords:
+                continue
+            if is_rain and effect.startswith('RH_'):
+                continue  # rain source: only consider water-level effects
+            if edge_strength[i, j] > best_w:
+                best_i, best_w = i, edge_strength[i, j]
+        if best_i is not None:
+            pairs.append((best_w, channel_names[best_i], cause))
+    pairs.sort(key=lambda p: p[0], reverse=True)
+    return pairs
+
+
+def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, top_k: int,
+              rain_shift_m: float, mode: str = 'top-k'):
+    graph = np.load(graph_path)
+    channel_names = load_channel_names(data_dir)
+    if graph.shape != (len(channel_names), len(channel_names)):
+        raise ValueError(f'graph shape {graph.shape} does not match {len(channel_names)} channels '
+                          f'found in {data_dir} - is --data-dir the dataset this graph was trained on?')
+
+    coords = load_locations(locations_csv, channel_names, rain_shift_m)
+    missing = [c for c in channel_names if c not in coords]
+    if missing:
+        print(f'{len(missing)} channel(s) skipped (no location in {locations_csv}): {missing}')
+
+    if mode == 'per-node-outgoing':
+        edges = strongest_outgoing_per_node(graph, channel_names, coords)
+    else:
+        edges = strongest_edges(graph, channel_names, coords, top_k)
+    if not edges:
+        raise ValueError('No edges to plot - no two located channels have a scored edge.')
+
+    center_lat = float(np.mean([lat for lat, lon in coords.values()]))
+    center_lon = float(np.mean([lon for lat, lon in coords.values()]))
+    # folium's built-in 'OpenStreetMap' tiles reject this kind of local/embedded use under OSM's
+    # tile usage policy (403), and 'CartoDB positron' now requires an API key too - Esri's public
+    # basemap service remains free and keyless for this.
+    m = folium.Map(
+        location=[center_lat, center_lon], zoom_start=10,
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+        attr='Esri, HERE, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors, and the GIS User Community',
+    )
+
+    for name, (lat, lon) in coords.items():
+        is_rain = name.startswith('RH_')
+        folium.CircleMarker(
+            location=[lat, lon],
+            radius=8,
+            color='steelblue' if is_rain else 'darkred',
+            fill=True,
+            fill_opacity=0.9,
+            popup=name,
+            tooltip=name,
+        ).add_to(m)
+
+    max_w = max(w for w, _, _ in edges)
+    min_w = min(w for w, _, _ in edges)
+    span = max_w - min_w or 1.0
+    for w, effect, cause in edges:
+        strength = float((w - min_w) / span)  # 0..1, relative to the plotted edges only - plain
+        # float: folium/branca JSON-serializes these and chokes on numpy scalar types (e.g. float32).
+        color = 'steelblue' if cause.startswith('RH_') else 'crimson'
+        line = folium.PolyLine(
+            locations=[coords[cause], coords[effect]],
+            color=color,
+            weight=1 + 4 * strength,
+            opacity=0.4 + 0.5 * strength,
+            tooltip=f'{cause} -> {effect}: {w:.4f}',
+        )
+        line.add_to(m)
+        PolyLineTextPath(line, '   ➤   ', repeat=True, offset=6,
+                          attributes={'fill': color, 'font-size': '14'}).add_to(m)
+
+    m.save(output)
+    print(f'Wrote {output}: {len(coords)} nodes, {len(edges)} edges plotted')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--graph', required=True, help='path to a cuts_plus_graph.npy')
+    parser.add_argument('--data-dir', required=True,
+                         help='dataset directory the graph was trained on (to recover channel order)')
+    parser.add_argument('--locations-csv', default='two_week_chunks/locations.csv')
+    parser.add_argument('--output', default='causal_map.html')
+    parser.add_argument('--top-k', type=int, default=15,
+                         help='number of strongest edges to draw (--mode top-k only)')
+    parser.add_argument('--mode', choices=['top-k', 'per-node-outgoing'], default='top-k',
+                         help='top-k: globally strongest edges. per-node-outgoing: for each source '
+                              'node, only its single strongest outgoing edge.')
+    parser.add_argument('--rain-shift-m', type=float, default=10000,
+                         help='meters to shift RH_* (rainfall) stations north before plotting')
+    args = parser.parse_args()
+    build_map(args.graph, args.data_dir, args.locations_csv, args.output, args.top_k,
+              args.rain_shift_m, args.mode)
+
+
+if __name__ == '__main__':
+    main()
