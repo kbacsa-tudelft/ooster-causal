@@ -1,9 +1,14 @@
 """
 Plots the discovered causal graph on a folium map using real station coordinates from
 locations.csv (EPSG:28992, Dutch RD). Nodes = channels with known coordinates; arrows = causal
-edges (effect <- cause), thicker/darker for stronger edges. Rainfall (RH_*) stations are shifted
-northward so they visually sit "above" the water-level network, since their real location isn't
-otherwise distinguishable on the map from a water-level sensor.
+edges (effect <- cause), thicker/darker for stronger edges, colored by source type (blue for
+rainfall, red for water level). Rainfall (RH_*) stations are shifted northward so they visually sit
+"above" the water-level network, since their real location isn't otherwise distinguishable on the
+map from a water-level sensor.
+
+--mode hover plots only nodes up front; hovering one animates its top --top-n strongest outgoing
+edges in instead of drawing every edge at once, which is far more legible once the node count gets
+large.
 
 Channels missing from locations.csv (and any edge touching one) are skipped and reported - not
 silently dropped.
@@ -110,8 +115,114 @@ def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: 
     return pairs
 
 
+def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict, top_n: int) -> dict:
+    """For each node acting as a cause (source), its top_n strongest outgoing edges (to other
+    located nodes). For an RH_* (rainfall) source, only WL_* (water-level) effects are considered -
+    a rain gauge's strongest link to another rain gauge isn't the physically interesting
+    relationship here (same restriction as strongest_outgoing_per_node, generalized to top_n).
+    Returns {cause_name: [(effect_name, weight), ...]}, strongest first."""
+    edge_strength = graph.copy()
+    np.fill_diagonal(edge_strength, 0.0)
+    n = len(channel_names)
+    result = {}
+    for j in range(n):
+        cause = channel_names[j]
+        if cause not in coords:
+            continue
+        is_rain = cause.startswith('RH_')
+        candidates = []
+        for i in range(n):
+            if i == j:
+                continue
+            effect = channel_names[i]
+            if effect not in coords:
+                continue
+            if is_rain and effect.startswith('RH_'):
+                continue
+            candidates.append((edge_strength[i, j], effect))
+        candidates.sort(reverse=True)
+        result[cause] = [(effect, float(w)) for w, effect in candidates[:top_n]]
+    return result
+
+
+def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coords: dict, top_n: int):
+    """Plots every located node; hovering one draws its top_n strongest outgoing edges as animated
+    dashed lines (color matches the source: blue for rainfall, red for water level), removed on
+    mouseout. All interactivity runs client-side (embedded JS), since the graph the user hovers is
+    fixed at render time - no server round-trip needed."""
+    top_edges = top_n_outgoing_per_node(graph, channel_names, coords, top_n)
+
+    marker_vars = []
+    for name, (lat, lon) in coords.items():
+        is_rain = name.startswith('RH_')
+        marker = folium.CircleMarker(
+            location=[lat, lon],
+            radius=8,
+            color='steelblue' if is_rain else 'darkred',
+            fill=True,
+            fill_opacity=0.9,
+            popup=name,
+            tooltip=name,
+        )
+        marker.add_to(m)
+        marker_vars.append((marker.get_name(), name))
+
+    node_coords_json = json.dumps({n: [lat, lon] for n, (lat, lon) in coords.items()})
+    top_edges_json = json.dumps(top_edges)
+
+    script_lines = [f"""
+<style>
+.hover-edge {{ stroke-dasharray: 8, 8; animation: causal_dash 0.6s linear infinite; }}
+@keyframes causal_dash {{ to {{ stroke-dashoffset: -16; }} }}
+</style>
+<script>
+(function() {{
+    var map = {m.get_name()};
+    var nodeCoords = {node_coords_json};
+    var topEdges = {top_edges_json};
+    var activeLines = [];
+
+    function clearLines() {{
+        activeLines.forEach(function(l) {{ map.removeLayer(l); }});
+        activeLines = [];
+    }}
+
+    function showLinks(source, color) {{
+        clearLines();
+        var edges = topEdges[source] || [];
+        if (!edges.length) return;
+        var weights = edges.map(function(e) {{ return e[1]; }});
+        var maxW = Math.max.apply(null, weights), minW = Math.min.apply(null, weights);
+        var span = (maxW - minW) || 1;
+        edges.forEach(function(e) {{
+            var target = e[0], w = e[1];
+            if (!nodeCoords[target]) return;
+            var strength = (w - minW) / span;
+            var line = L.polyline([nodeCoords[source], nodeCoords[target]], {{
+                color: color, weight: 2 + 4 * strength, opacity: 0.55 + 0.45 * strength,
+            }}).addTo(map);
+            line.bindTooltip(source + ' -> ' + target + ': ' + w.toFixed(4));
+            var el = line.getElement();
+            if (el) {{ el.classList.add('hover-edge'); }}
+            activeLines.push(line);
+        }});
+    }}
+"""]
+    for marker_var, name in marker_vars:
+        color = 'steelblue' if name.startswith('RH_') else 'crimson'
+        script_lines.append(
+            f"    {marker_var}.on('mouseover', function() {{ "
+            f"showLinks({json.dumps(name)}, {json.dumps(color)}); }});\n"
+            f"    {marker_var}.on('mouseout', clearLines);\n"
+        )
+    script_lines.append('})();\n</script>\n')
+
+    m.get_root().html.add_child(folium.Element(''.join(script_lines)))
+    print(f'Wrote hover map: {len(coords)} nodes, up to {top_n} outgoing edges shown per hover')
+
+
 def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, top_k: int,
-              rain_shift_m: float, mode: str = 'top-k'):
+              rain_shift_m: float, mode: str = 'top-k', top_n: int = 5):
     graph = np.load(graph_path)
     channel_names = load_channel_names(data_dir, graph_path)
     if graph.shape != (len(channel_names), len(channel_names)):
@@ -123,13 +234,6 @@ def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, t
     if missing:
         print(f'{len(missing)} channel(s) skipped (no location in {locations_csv}): {missing}')
 
-    if mode == 'per-node-outgoing':
-        edges = strongest_outgoing_per_node(graph, channel_names, coords)
-    else:
-        edges = strongest_edges(graph, channel_names, coords, top_k)
-    if not edges:
-        raise ValueError('No edges to plot - no two located channels have a scored edge.')
-
     center_lat = float(np.mean([lat for lat, lon in coords.values()]))
     center_lon = float(np.mean([lon for lat, lon in coords.values()]))
     # folium's built-in 'OpenStreetMap' tiles reject this kind of local/embedded use under OSM's
@@ -140,6 +244,19 @@ def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, t
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
         attr='Esri, HERE, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors, and the GIS User Community',
     )
+
+    if mode == 'hover':
+        build_hover_map(m, graph, channel_names, coords, top_n)
+        m.save(output)
+        print(f'Wrote {output}')
+        return
+
+    if mode == 'per-node-outgoing':
+        edges = strongest_outgoing_per_node(graph, channel_names, coords)
+    else:
+        edges = strongest_edges(graph, channel_names, coords, top_k)
+    if not edges:
+        raise ValueError('No edges to plot - no two located channels have a scored edge.')
 
     for name, (lat, lon) in coords.items():
         is_rain = name.startswith('RH_')
@@ -184,14 +301,17 @@ def main():
     parser.add_argument('--output', default='causal_map.html')
     parser.add_argument('--top-k', type=int, default=15,
                          help='number of strongest edges to draw (--mode top-k only)')
-    parser.add_argument('--mode', choices=['top-k', 'per-node-outgoing'], default='top-k',
+    parser.add_argument('--mode', choices=['top-k', 'per-node-outgoing', 'hover'], default='top-k',
                          help='top-k: globally strongest edges. per-node-outgoing: for each source '
-                              'node, only its single strongest outgoing edge.')
+                              'node, only its single strongest outgoing edge. hover: plot all nodes '
+                              'and show a node\'s top --top-n outgoing edges (animated) on hover.')
     parser.add_argument('--rain-shift-m', type=float, default=10000,
                          help='meters to shift RH_* (rainfall) stations north before plotting')
+    parser.add_argument('--top-n', type=int, default=5,
+                         help='number of outgoing edges to show per node on hover (--mode hover only)')
     args = parser.parse_args()
     build_map(args.graph, args.data_dir, args.locations_csv, args.output, args.top_k,
-              args.rain_shift_m, args.mode)
+              args.rain_shift_m, args.mode, args.top_n)
 
 
 if __name__ == '__main__':
