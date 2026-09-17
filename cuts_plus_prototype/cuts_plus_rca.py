@@ -290,13 +290,19 @@ def fill_missing(data: np.ndarray, fill_values: np.ndarray) -> np.ndarray:
 
 def fit_residual_thresholds(residuals: np.ndarray, observed: np.ndarray = None):
     """Per-column median/std of residuals. If `observed` (same shape, 1=observed) is given, only
-    residuals computed against genuinely-observed values are used."""
+    residuals computed against genuinely-observed values are used. Non-finite residuals (the network
+    can output NaN/Inf for a window where some other channel's value is a numerically extreme
+    outlier, since message passing mixes all channels together) are dropped before the statistics
+    are computed, rather than poisoning median/std into NaN for the whole channel."""
     if observed is None:
         return np.median(residuals, axis=0), np.std(residuals, axis=0)
     median = np.full(residuals.shape[1], np.nan)
     std = np.full(residuals.shape[1], np.nan)
     for c in range(residuals.shape[1]):
         col = residuals[observed[:, c] > 0, c]
+        col = col[np.isfinite(col)]
+        if len(col) == 0:
+            continue
         median[c] = np.median(col)
         std[c] = np.std(col)
     return median, std
@@ -335,14 +341,22 @@ def fit_pot_thresholds(z_scores_val: np.ndarray, risk, initial_level, num_candid
     applied to new data afterwards - the right shape for real deployment with no labels. If
     `observed` is given, only genuinely-observed z-scores are used per column - a column with fewer
     than `min_observed` of those (not enough for a meaningful tail fit; pot() can crash on very small
-    samples) gets threshold=NaN, which score_session/flags treats as "never flags" rather than
+    samples), or whose median/std came out NaN (see fit_residual_thresholds) making every z-score in
+    it non-finite, gets threshold=NaN, which score_session/flags treats as "never flags" rather than
     crashing (a channel with almost no validation data can't have anomalies meaningfully detected)."""
     thresholds = np.full(z_scores_val.shape[1], np.nan)
+    skipped_nonfinite = []
     for i in range(z_scores_val.shape[1]):
-        col = z_scores_val[observed[:, i] > 0, i] if observed is not None else z_scores_val[:, i]
+        raw_col = z_scores_val[observed[:, i] > 0, i] if observed is not None else z_scores_val[:, i]
+        col = raw_col[np.isfinite(raw_col)]
         if len(col) < min_observed:
+            if len(col) < len(raw_col):
+                skipped_nonfinite.append(i)
             continue
         thresholds[i] = pot(col, risk, initial_level, num_candidates)[0]
+    if skipped_nonfinite:
+        print(f'{len(skipped_nonfinite)} channel(s) had non-finite (NaN/Inf) validation z-scores '
+              f'(column index: {skipped_nonfinite}) - skipped rather than crashing pot().')
     return thresholds
 
 
