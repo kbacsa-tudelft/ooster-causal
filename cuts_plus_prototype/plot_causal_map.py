@@ -45,22 +45,36 @@ def load_channel_names(data_dir: str, graph_path: str) -> list:
 
 
 def load_locations(locations_csv: str, channel_names: list, rain_shift_m: float) -> dict:
-    """Maps channel name -> (lat, lon), converting from EPSG:28992 and shifting RH_* stations
-    `rain_shift_m` meters north (in the original projected CRS, so the shift is a true distance)
-    before converting to lat/lon. locations.csv drops the "WL_" prefix that water-level channels
-    have in the data; RH_* names match directly."""
+    """Maps channel name -> (lat, lon), shifting RH_* stations `rain_shift_m` meters north before
+    converting to lat/lon. locations.csv drops the "WL_" prefix that water-level channels have in
+    the data; RH_* names match directly.
+
+    Supports two locations.csv schemas, detected by column names:
+      - name/x/y (EPSG:28992, e.g. two_week_chunks_*) - projected to lat/lon via pyproj, and the
+        shift is a true distance since it's applied in the projected CRS before conversion.
+      - name/lat/lon (already lat/lon, e.g. rws_data_adapted) - used directly; the shift is applied
+        as an approximate degrees-latitude offset (111,320 m/degree), since there's no projected CRS
+        to shift a true distance in here.
+    """
     locs = pd.read_csv(locations_csv).set_index('name')
-    transformer = Transformer.from_crs('EPSG:28992', 'EPSG:4326', always_xy=True)
+    is_projected = 'x' in locs.columns and 'y' in locs.columns
+    if is_projected:
+        transformer = Transformer.from_crs('EPSG:28992', 'EPSG:4326', always_xy=True)
 
     coords = {}
     for c in channel_names:
         stripped = c[len('WL_'):] if c.startswith('WL_') else c
         if stripped not in locs.index:
             continue
-        x, y = float(locs.loc[stripped, 'x']), float(locs.loc[stripped, 'y'])
-        if c.startswith('RH_'):
-            y = y + rain_shift_m
-        lon, lat = transformer.transform(x, y)
+        if is_projected:
+            x, y = float(locs.loc[stripped, 'x']), float(locs.loc[stripped, 'y'])
+            if c.startswith('RH_'):
+                y = y + rain_shift_m
+            lon, lat = transformer.transform(x, y)
+        else:
+            lat, lon = float(locs.loc[stripped, 'lat']), float(locs.loc[stripped, 'lon'])
+            if c.startswith('RH_'):
+                lat = lat + rain_shift_m / 111320
         coords[c] = (float(lat), float(lon))  # plain floats: folium/branca JSON-serializes these
     return coords
 

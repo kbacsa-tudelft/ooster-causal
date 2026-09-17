@@ -28,7 +28,7 @@ from sklearn.metrics import f1_score
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'vendor'))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cuts_plus import MultiCAD, batch_generater  # noqa: E402  (vendor/cuts_plus.py)
+from cuts_plus import MultiCAD  # noqa: E402  (vendor/cuts_plus.py)
 from utils.logger import MyLogger  # noqa: E402  (vendor/utils/logger.py)
 
 from aerca import (  # noqa: E402
@@ -93,6 +93,8 @@ class CUTSPlusRCAConfig:
     save_dir: str = 'saved_models'
     log_dir: str = 'runs'
     device: str = ''
+    predict_chunk_size: int = 512  # windows per forward pass in predict_residuals; lower this if
+    # scoring/validation OOMs at high channel counts (message passing is O(n_nodes^2) per window)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -210,40 +212,61 @@ def build_opt(config: CUTSPlusRCAConfig, n_nodes: int):
     })
 
 
-def predict_residuals(multicad: MultiCAD, data: np.ndarray, device, mask: np.ndarray = None):
+def predict_residuals(multicad: MultiCAD, data: np.ndarray, device, mask: np.ndarray = None,
+                       chunk_size: int = 512):
     """One-step-ahead prediction residuals (actual - predicted) for every valid window in `data`,
     using the trained fitting_model and its current learned graph, in time order. `data` is 2D
     (T, N), already normalized the same way the training data was. `mask` (T, N), 1=observed,
     0=missing/imputed - defaults to all-observed. Returns (residuals, observed), where `observed`
     is the target-side mask aligned the same way as `residuals`, so callers can exclude residuals
-    computed against imputed (never actually observed) values."""
+    computed against imputed (never actually observed) values.
+
+    Windows are processed `chunk_size` at a time rather than all at once: the network's internal
+    message passing is O(n_nodes^2) per window, so a session with thousands of windows at a high
+    channel count can exhaust memory in a single forward pass (this OOM'd at 633 channels with the
+    whole-session batch this function used to build). Each window only depends on its own
+    input_step-length slice - there's no recurrent state carried across windows - so chunking is
+    purely a memory/batch-size choice and changes no result, only computed and reassembled in
+    smaller pieces before being sorted back into time order."""
     n_nodes = data.shape[1]
     input_step = multicad.args.input_step
     if mask is None:
         mask = np.ones_like(data)
-    data3 = data[:, :, None]
-    mask3 = mask[:, :, None]
-    data_t = torch.from_numpy(data3).float().to(device)
-    mask_t = torch.from_numpy(mask3).float().to(device)
+    data_t = torch.from_numpy(data[:, :, None]).float().to(device)
+    mask_t = torch.from_numpy(mask[:, :, None]).float().to(device)
 
     t_length = data.shape[0]
-    bs = t_length - input_step  # one batch covering every valid window, none dropped
-    x, y, t_idx, mask_x, mask_y = next(batch_generater(
-        data_t, mask_t, bs=bs, n_nodes=n_nodes, input_step=input_step, pred_step=1, block_size=None))
+    n_windows = t_length - input_step  # every valid window, none dropped
+    t_idx_all = torch.arange(input_step, t_length, device=device, dtype=torch.long)
+    x_offsets = torch.arange(-input_step, 0, device=device, dtype=torch.long)
+    y_offsets = torch.zeros(1, device=device, dtype=torch.long)
 
     # Recompute the (untransposed, source->target) edge-weight matrix the network was actually
     # trained with - NOT the value returned by MultiCAD.train(), which gets transposed once for
     # comparison against true_cm and is not the convention the forward pass expects.
     graph = torch.einsum('nm,ml->nl', multicad.G, torch.sigmoid(multicad.GT))
-    graph_expanded = graph[None].expand(x.shape[0], -1, -1)
 
     multicad.fitting_model.eval()
+    residual_chunks, observed_chunks, t_idx_chunks = [], [], []
     with torch.no_grad():
-        y_pred = multicad.fitting_model(x, mask_x, graph_expanded)
+        for start in range(0, n_windows, chunk_size):
+            t_idx = t_idx_all[start:start + chunk_size]
+            x_idx = t_idx.unsqueeze(1) + x_offsets.unsqueeze(0)
+            y_idx = t_idx.unsqueeze(1) + y_offsets.unsqueeze(0)
+            x = data_t[x_idx].permute(0, 2, 1, 3)
+            y = data_t[y_idx].permute(0, 2, 1, 3)
+            mask_x = mask_t[x_idx].permute(0, 2, 1, 3)
+            mask_y = mask_t[y_idx].permute(0, 2, 1, 3)
+            graph_expanded = graph[None].expand(x.shape[0], -1, -1)
 
-    residual = (y - y_pred).squeeze(-1).squeeze(-1).cpu().numpy()
-    observed = mask_y.squeeze(-1).squeeze(-1).cpu().numpy()
-    order = np.argsort(t_idx.cpu().numpy())
+            y_pred = multicad.fitting_model(x, mask_x, graph_expanded)
+            residual_chunks.append((y - y_pred).squeeze(-1).squeeze(-1).cpu())
+            observed_chunks.append(mask_y.squeeze(-1).squeeze(-1).cpu())
+            t_idx_chunks.append(t_idx.cpu())
+
+    residual = torch.cat(residual_chunks).numpy()
+    observed = torch.cat(observed_chunks).numpy()
+    order = np.argsort(torch.cat(t_idx_chunks).numpy())
     return residual[order], observed[order]
 
 
@@ -324,13 +347,13 @@ def fit_pot_thresholds(z_scores_val: np.ndarray, risk, initial_level, num_candid
 
 
 def score_session(multicad: MultiCAD, data_2d: np.ndarray, median, std, pot_thresholds, device,
-                   mask: np.ndarray = None):
+                   mask: np.ndarray = None, chunk_size: int = 512):
     """Scores one (already-normalized) session against thresholds fit on validation data. Returns
     (z_scores, flags, observed) with flags[t, i] True where variable i's residual at time t exceeds
     its POT threshold - i.e. a candidate anomaly, with no label to check it against. `observed[t, i]`
     is 1 where that position was a real (not imputed) reading - callers should ignore flags/z_scores
     where observed is 0."""
-    residuals, observed = predict_residuals(multicad, data_2d, device, mask=mask)
+    residuals, observed = predict_residuals(multicad, data_2d, device, mask=mask, chunk_size=chunk_size)
     std_safe = np.where(std == 0, 1e-8, std)
     z_scores = (residuals - median) / std_safe
     flags = z_scores > pot_thresholds[None, :]
@@ -421,10 +444,12 @@ def run_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_plus_rca')
     for k, v in causal_metrics.items():
         log.log_metrics({f'test/causal_{k}': float(v)}, config.total_epoch)
 
-    val_residuals, _ = predict_residuals(multicad, normalize(val_data), device)
+    val_residuals, _ = predict_residuals(multicad, normalize(val_data), device,
+                                          chunk_size=config.predict_chunk_size)
     median, std = fit_residual_thresholds(val_residuals)
 
-    test_residuals, _ = predict_residuals(multicad, normalize(test_data), device)
+    test_residuals, _ = predict_residuals(multicad, normalize(test_data), device,
+                                           chunk_size=config.predict_chunk_size)
     rc_metrics = root_cause_analysis(test_residuals, test_labels, median, std,
                                       config.risk, config.initial_level, config.num_candidates,
                                       config.input_step)
@@ -541,7 +566,8 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     val_pairs = []
     for vid in val_ids:
         filled, mask = session_data_and_mask(series_dict[vid][channel_names])
-        val_pairs.append(predict_residuals(multicad, normalize(filled), device, mask=mask))
+        val_pairs.append(predict_residuals(multicad, normalize(filled), device, mask=mask,
+                                            chunk_size=config.predict_chunk_size))
     val_residuals = np.concatenate([r for r, _ in val_pairs], axis=0)
     val_observed = np.concatenate([o for _, o in val_pairs], axis=0)
     median, std = fit_residual_thresholds(val_residuals, observed=val_observed)
@@ -561,7 +587,7 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     for sid in score_ids:
         filled, mask = session_data_and_mask(series_dict[sid][channel_names])
         z_scores, flags, observed = score_session(multicad, normalize(filled), median, std, pot_thresholds,
-                                                    device, mask=mask)
+                                                    device, mask=mask, chunk_size=config.predict_chunk_size)
         flagged_fraction = flags[observed > 0].mean() if observed.sum() > 0 else float('nan')
         per_var_fraction = np.array([
             flags[observed[:, c] > 0, c].mean() if observed[:, c].sum() > 0 else np.nan
