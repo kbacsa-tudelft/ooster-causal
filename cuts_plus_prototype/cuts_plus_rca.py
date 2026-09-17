@@ -334,18 +334,26 @@ def root_cause_analysis(residuals_test, labels_test, median, std, risk, initial_
 
 
 def fit_pot_thresholds(z_scores_val: np.ndarray, risk, initial_level, num_candidates,
-                        observed: np.ndarray = None, min_observed: int = 50):
+                        observed: np.ndarray = None, min_observed: int = 50, min_std: float = 1e-6):
     """Unsupervised: fits a per-variable POT/EVT threshold from a validation (known-normal) z-score
     distribution. Unlike root_cause_analysis (which mirrors AERCA's benchmark convention of fitting
     POT on the evaluation window itself), this fits on held-out normal data and is meant to be
     applied to new data afterwards - the right shape for real deployment with no labels. If
-    `observed` is given, only genuinely-observed z-scores are used per column - a column with fewer
-    than `min_observed` of those (not enough for a meaningful tail fit; pot() can crash on very small
-    samples), or whose median/std came out NaN (see fit_residual_thresholds) making every z-score in
-    it non-finite, gets threshold=NaN, which score_session/flags treats as "never flags" rather than
-    crashing (a channel with almost no validation data can't have anomalies meaningfully detected)."""
+    `observed` is given, only genuinely-observed z-scores are used per column. A column gets
+    threshold=NaN (score_session/flags treats that as "never flags") instead of a value from pot(),
+    for any of these reasons:
+      - fewer than `min_observed` genuinely-observed entries (not enough for a meaningful tail fit)
+      - median/std came out NaN (see fit_residual_thresholds) making every z-score non-finite
+      - std below `min_std` - an exactly-constant channel's z-scores are exactly 0 everywhere, which
+        pot() can't compute a threshold for at all (empty "peaks over threshold" array)
+      - pot() raises anyway - a near-constant or discretized/low-cardinality channel (e.g. a
+        real-world sensor that only reports a couple of distinct readings) can pass both guards
+        above yet still make its top ~2% tail collapse to (near-)identical values, which is exactly
+        what grimshaw()'s Grimshaw's-trick bounds divide by; this is caught generically here rather
+        than trying to characterize every pathological input shape a real channel might produce.
+    """
     thresholds = np.full(z_scores_val.shape[1], np.nan)
-    skipped_nonfinite = []
+    skipped_nonfinite, skipped_degenerate, skipped_pot_error = [], [], []
     for i in range(z_scores_val.shape[1]):
         raw_col = z_scores_val[observed[:, i] > 0, i] if observed is not None else z_scores_val[:, i]
         col = raw_col[np.isfinite(raw_col)]
@@ -353,10 +361,23 @@ def fit_pot_thresholds(z_scores_val: np.ndarray, risk, initial_level, num_candid
             if len(col) < len(raw_col):
                 skipped_nonfinite.append(i)
             continue
-        thresholds[i] = pot(col, risk, initial_level, num_candidates)[0]
+        if np.std(col) < min_std:
+            skipped_degenerate.append(i)
+            continue
+        try:
+            thresholds[i] = pot(col, risk, initial_level, num_candidates)[0]
+        except Exception:
+            skipped_pot_error.append(i)
     if skipped_nonfinite:
         print(f'{len(skipped_nonfinite)} channel(s) had non-finite (NaN/Inf) validation z-scores '
               f'(column index: {skipped_nonfinite}) - skipped rather than crashing pot().')
+    if skipped_degenerate:
+        print(f'{len(skipped_degenerate)} channel(s) have near-constant (std < {min_std}) validation '
+              f'z-scores (column index: {skipped_degenerate}) - POT/EVT has no tail to fit on a '
+              f'degenerate distribution, so these were skipped rather than crashing pot().')
+    if skipped_pot_error:
+        print(f'{len(skipped_pot_error)} channel(s) made pot() raise (likely a low-cardinality/'
+              f'discretized tail - column index: {skipped_pot_error}) - skipped rather than crashing.')
     return thresholds
 
 
