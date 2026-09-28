@@ -95,10 +95,12 @@ class CUTSPlusRCAConfig:
     device: str = ''
     predict_chunk_size: int = 512  # windows per forward pass in predict_residuals; lower this if
     # scoring/validation OOMs at high channel counts (message passing is O(n_nodes^2) per window)
-    min_channel_observations: int = 1  # drop any channel with fewer real observations than this
-    # across all training sessions - also shrinks n_channels, which MultiCAD.train() multiplies by
-    # total training timesteps several times over for its GPU-resident copies of the whole dataset,
-    # so this is the main lever for fitting a wide, long-history dataset into limited GPU memory
+    min_channel_availability: float = 0.0  # drop any channel observed in less than this fraction of
+    # training rows (0.1 = 10%); always requires at least 1 real observation regardless of this value
+    # (fill_missing has no mean to fall back on otherwise). Shrinks n_channels, which MultiCAD.train()
+    # multiplies by total training timesteps several times over for its GPU-resident copies of the
+    # whole dataset, so this is the main lever for fitting a wide, long-history dataset into limited
+    # GPU memory
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -545,18 +547,21 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
 
     train_data, train_mask = concat_sessions(series_dict, train_ids, boundary_gap=config.input_step)
 
-    # A channel with fewer real observations than min_channel_observations across all training
-    # sessions has too little (or no) signal to learn from - and at the default threshold of 1, no
-    # train_mean at all, so fill_missing can't fill it (NaN stays NaN), which poisons the whole
-    # network's gradients within a step or two. Drop any such channel entirely. Raising the threshold
-    # above 1 also trades away sparsely-observed channels to shrink n_channels - the main lever for
-    # fitting a wide dataset into limited GPU memory, since MultiCAD.train() multiplies it by total
-    # training timesteps several times over for its GPU-resident copies of the whole dataset.
-    sparse = train_mask.sum(axis=0) < config.min_channel_observations
+    # A channel observed in less than min_channel_availability of training rows has too little (or
+    # no) signal to learn from - and with zero real observations, no train_mean at all, so
+    # fill_missing can't fill it (NaN stays NaN), which poisons the whole network's gradients within
+    # a step or two. Drop any such channel entirely - always at least the zero-observation case
+    # (min_count floored at 1) regardless of how low min_channel_availability is set. Raising it above
+    # 0 also trades away sparsely-observed channels to shrink n_channels - the main lever for fitting
+    # a wide dataset into limited GPU memory, since MultiCAD.train() multiplies it by total training
+    # timesteps several times over for its GPU-resident copies of the whole dataset.
+    min_count = max(1, round(config.min_channel_availability * train_mask.shape[0]))
+    sparse = train_mask.sum(axis=0) < min_count
     if sparse.any():
         dropped = [c for c, drop in zip(channel_names, sparse) if drop]
-        print(f'Dropping {len(dropped)} channel(s) with fewer than {config.min_channel_observations} '
-              f'observation(s) across all training sessions: {dropped}')
+        print(f'Dropping {len(dropped)} channel(s) with fewer than {min_count} observation(s) '
+              f'({config.min_channel_availability:.1%} of {train_mask.shape[0]} training rows) '
+              f'across all training sessions: {dropped}')
         channel_names = [c for c, drop in zip(channel_names, sparse) if not drop]
         train_data = train_data[:, ~sparse]
         train_mask = train_mask[:, ~sparse]
