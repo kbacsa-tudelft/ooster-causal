@@ -47,21 +47,32 @@ import os
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 
-def detect_coarsest_freq(dedup_frames: list) -> pd.Timedelta:
-    """Each frame's native cadence = the mode of its own consecutive timestamp diffs. The dataset's
-    target frequency is the coarsest (largest) of those across all sessions."""
+def scan_columns_and_freq(files: list) -> tuple:
+    """First pass, schema/index-only (no data columns loaded) - cheap even for hundreds of wide
+    sessions. Returns (sorted column union, coarsest native cadence, total duplicate row count).
+    Coarsest native cadence = the max across sessions of each session's own modal consecutive-
+    timestamp diff (so a finer-sampled session doesn't override a genuinely coarser one)."""
+    all_columns = set()
     modal_deltas = []
-    for df in dedup_frames:
-        if len(df.index) < 2:
-            continue
-        diffs = df.index.to_series().diff().dropna()
-        if len(diffs):
-            modal_deltas.append(diffs.value_counts().idxmax())
+    total_dupes = 0
+    for f in files:
+        names = pq.ParquetFile(f).schema_arrow.names
+        all_columns.update(c for c in names if c != 'timestamp' and not c.startswith('__index_level'))
+
+        idx = pd.read_parquet(f, columns=[]).index  # index only - the data columns aren't loaded
+        deduped = idx[~idx.duplicated(keep='first')]
+        total_dupes += len(idx) - len(deduped)
+        if len(deduped) >= 2:
+            diffs = deduped.to_series().diff().dropna()
+            if len(diffs):
+                modal_deltas.append(diffs.value_counts().idxmax())
+
     if not modal_deltas:
         raise ValueError('Could not detect a native sampling frequency from any session.')
-    return max(modal_deltas)
+    return sorted(all_columns), max(modal_deltas), total_dupes
 
 
 def prepare(input_dir: str, output_dir: str, freq: str = 'auto', min_rows: int = 144,
@@ -70,33 +81,41 @@ def prepare(input_dir: str, output_dir: str, freq: str = 'auto', min_rows: int =
     if not files:
         raise ValueError(f'No .parquet files found in {input_dir}')
 
-    print(f'Loading {len(files)} raw session(s)...')
-    dedup_frames = {}
-    total_dupes = 0
-    for f in files:
-        df = pd.read_parquet(f)
-        dedup = df[~df.index.duplicated(keep='first')]
-        total_dupes += len(df) - len(dedup)
-        dedup_frames[os.path.basename(f)] = dedup
-
+    print(f'Scanning {len(files)} raw session(s) (schema/index only)...')
+    channel_names, coarsest_delta, total_dupes = scan_columns_and_freq(files)
     if freq == 'auto':
-        target = detect_coarsest_freq(list(dedup_frames.values()))
-        freq = pd.tseries.frequencies.to_offset(target).freqstr
+        freq = pd.tseries.frequencies.to_offset(coarsest_delta).freqstr
         print(f'Auto-detected target frequency: {freq} (coarsest native cadence found)')
+    n_channels = len(channel_names)
+    print(f'{n_channels} channels in the union schema, {total_dupes} duplicate row(s) found')
 
-    print(f'Resampling {len(dedup_frames)} session(s) onto a {freq} grid...')
+    print(f'Resampling and writing {len(files)} session(s) onto a {freq} grid...')
     if rain_window:
         print(f'Replacing each RH_* channel with its rolling {rain_window} sum...')
-    prepared = {}
-    all_columns = set()
-    for name, dedup in dedup_frames.items():
+
+    # Running per-channel sum/sum-of-squares/observed-count, updated one session at a time, so
+    # normalization stats never require holding every (reindexed-to-the-full-union) session in
+    # memory at once - the previous approach OOM'd on a wide, many-session dataset (417 sessions x
+    # ~1300 union columns) despite each session on its own being perfectly manageable.
+    os.makedirs(output_dir, exist_ok=True)
+    sum_ = np.zeros(n_channels)
+    sumsq = np.zeros(n_channels)
+    count = np.zeros(n_channels)
+    n_kept = 0
+    total_rows = 0
+    for f in files:
+        name = os.path.basename(f)
+        df = pd.read_parquet(f)
+        dedup = df[~df.index.duplicated(keep='first')]
+        del df
+
         rain_cols = [c for c in dedup.columns if c.startswith('RH_')]
         other_cols = [c for c in dedup.columns if c not in rain_cols]
-
         parts = [dedup[other_cols].resample(freq).mean()]
         if rain_cols:
             parts.append(dedup[rain_cols].resample(freq).sum(min_count=1))
         regular = pd.concat(parts, axis=1)[dedup.columns]
+        del dedup
 
         if rain_window and rain_cols:
             regular[rain_cols] = regular[rain_cols].rolling(rain_window, min_periods=1).sum()
@@ -104,29 +123,32 @@ def prepare(input_dir: str, output_dir: str, freq: str = 'auto', min_rows: int =
         if len(regular) < min_rows:
             print(f'  skipping {name}: only {len(regular)} rows on the {freq} grid (< {min_rows})')
             continue
-        prepared[name] = regular
-        all_columns.update(regular.columns)
 
-    channel_names = sorted(all_columns)
-    print(f'{len(prepared)} session(s) kept, {len(channel_names)} channels in the union schema, '
-          f'{total_dupes} duplicate row(s) dropped')
+        regular = regular.reindex(columns=channel_names)
+        regular.to_parquet(os.path.join(output_dir, name))
 
-    os.makedirs(output_dir, exist_ok=True)
-    for name, df in prepared.items():
-        df.reindex(columns=channel_names).to_parquet(os.path.join(output_dir, name))
+        values = regular.values
+        finite = np.isfinite(values)
+        sum_ += np.where(finite, values, 0).sum(axis=0)
+        sumsq += np.where(finite, values * values, 0).sum(axis=0)
+        count += finite.sum(axis=0)
+        n_kept += 1
+        total_rows += len(regular)
+        del regular, values
 
-    concatenated = np.concatenate(
-        [df.reindex(columns=channel_names).values for df in prepared.values()], axis=0)
-    mean = np.nanmean(concatenated, axis=0)
-    std = np.nanstd(concatenated, axis=0)
+    count_safe = np.where(count == 0, 1, count)
+    mean = np.where(count > 0, sum_ / count_safe, np.nan)
+    variance = np.clip(sumsq / count_safe - mean ** 2, 0, None)  # clip: fp cancellation can go ~0-
+    std = np.where(count > 0, np.sqrt(variance), np.nan)         # negative for a near-constant channel
+
     stats = {'mean': dict(zip(channel_names, mean.tolist())),
              'std': dict(zip(channel_names, std.tolist()))}
     with open(os.path.join(output_dir, 'normalization_stats.json'), 'w') as fh:
         json.dump(stats, fh, indent=2)
 
-    total_cells = concatenated.size
-    n_missing = int(np.isnan(concatenated).sum())
-    print(f'Wrote {len(prepared)} sessions to {output_dir}')
+    total_cells = total_rows * n_channels
+    n_missing = total_cells - int(count.sum())
+    print(f'Wrote {n_kept} sessions to {output_dir}')
     print(f'Overall missing fraction: {n_missing / total_cells:.4f} ({n_missing}/{total_cells} cells)')
 
 
