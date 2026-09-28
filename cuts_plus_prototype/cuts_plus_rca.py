@@ -101,6 +101,9 @@ class CUTSPlusRCAConfig:
     # multiplies by total training timesteps several times over for its GPU-resident copies of the
     # whole dataset, so this is the main lever for fitting a wide, long-history dataset into limited
     # GPU memory
+    checkpoint_every: int = 1  # save a resumable checkpoint to save_dir/checkpoint.pt every this many
+    # epochs (real-data pipeline only) - rerunning the same command (same --save-dir) after an
+    # interruption resumes from it automatically, with no separate --resume flag needed
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -599,12 +602,20 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
             log.log_figures(plot_labeled_adjacency(raw_graph.T, channel_names), name='causal_graph',
                              iters=epoch_i + 1)
 
+    save_dir = os.path.join(os.getcwd(), config.save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    checkpoint_path = os.path.join(save_dir, 'checkpoint.pt')
+
     multicad = MultiCAD(opt, log, device=device)
     train_norm = normalize(train_data)
     # true_cm=None (no ground truth) - so, unlike run_pipeline, the graph MultiCAD.train() returns is
     # NOT auto-transposed into "row=effect, col=cause" convention. Transpose it ourselves below.
+    # checkpoint_path lives in save_dir, so rerunning the exact same command (same --save-dir) after an
+    # interruption resumes automatically - train() loads it if present, and skips loading (a fresh
+    # start) if this is the first run.
     graph = multicad.train(train_norm[:, :, None], train_mask[:, :, None], train_norm[:, :, None],
-                            true_cm=None, epoch_callback=plot_epoch_graph)
+                            true_cm=None, epoch_callback=plot_epoch_graph,
+                            checkpoint_path=checkpoint_path, checkpoint_every=config.checkpoint_every)
     graph = graph.T
 
     log.log_figures(plot_labeled_adjacency(graph, channel_names), name='causal_graph',
@@ -625,9 +636,6 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     if unscoreable:
         print(f'{len(unscoreable)} channel(s) have too little validation data to set an anomaly '
               f'threshold, so they will never be flagged: {unscoreable}')
-
-    save_dir = os.path.join(os.getcwd(), config.save_dir)
-    os.makedirs(save_dir, exist_ok=True)
 
     print('=' * 50)
     print('Scoring held-out sessions (no ground truth - reporting flagged fractions, not accuracy):')

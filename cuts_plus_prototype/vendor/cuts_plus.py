@@ -1,5 +1,5 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Five deliberate deviations from upstream, kept as the only edits so this stays
+# see ../LICENSE). Six deliberate deviations from upstream, kept as the only edits so this stays
 # otherwise faithful to the source:
 #   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
 #      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
@@ -29,6 +29,13 @@
 #      grouping cheaply (a shuffled list of window-start integers), and materialize_batch() builds one
 #      batch's real tensors on demand inside each loop, so peak memory is one batch at a time - both
 #      loops still iterate the exact same index groups, so results are unchanged.
+#   6. MultiCAD.train() gained optional checkpoint_path/checkpoint_every parameters (default None/1,
+#      so any existing caller is unaffected): every checkpoint_every epochs, the model, both
+#      optimizers/schedulers, and the coarse-to-fine graph state (G, GT, n_groups, lambda_s,
+#      gumbel_tau) are saved to checkpoint_path; if that file already exists when train() is called,
+#      it's loaded and training resumes right after the epoch it was saved at. Added for real-dataset
+#      runs long enough (hours) that losing all progress to an interruption is a real cost - a pure
+#      addition, no effect on any run that doesn't pass checkpoint_path.
 
 import logging
 import os, sys
@@ -263,11 +270,14 @@ class MultiCAD(object):
 
 
 
-    def train(self, data, observ_mask, original_data, true_cm=None, epoch_callback=None):
+    def train(self, data, observ_mask, original_data, true_cm=None, epoch_callback=None,
+              checkpoint_path=None, checkpoint_every=1):
         # perf patch note above covers deviations 1-2; this optional epoch_callback param is a third,
         # purely additive one: defaults to None (no-op, unchanged behavior for any existing caller),
         # invoked as epoch_callback(epoch_i, Graph) once per epoch with the raw (untransposed,
         # source->target) graph, so a caller can e.g. plot it periodically without modifying this loop.
+        # checkpoint_path/checkpoint_every are a sixth, also purely additive deviation - both default
+        # to a no-op for any existing caller. See deviation 6 in the header comment.
 
         original_data = torch.from_numpy(original_data).float().to(self.device)
         observ_mask = torch.from_numpy(observ_mask).float().to(self.device)
@@ -283,11 +293,32 @@ class MultiCAD(object):
 
         latent_pred_step = 0
         graph_discov_step = 0
-        pbar = tqdm.tqdm(total=self.args.total_epoch)
+        start_epoch = 0
+        if checkpoint_path is not None and os.path.exists(checkpoint_path):
+            ckpt = torch.load(checkpoint_path, map_location=self.device)
+            self.fitting_model.load_state_dict(ckpt["fitting_model_state"])
+            self.data_pred_optimizer.load_state_dict(ckpt["data_pred_optimizer_state"])
+            self.data_pred_scheduler.load_state_dict(ckpt["data_pred_scheduler_state"])
+            self.n_groups = ckpt["n_groups"]
+            self.G = ckpt["G"].to(self.device)
+            self.GT = nn.Parameter(ckpt["GT"].to(self.device))
+            self.lambda_s = ckpt["lambda_s"]
+            self.gumbel_tau = ckpt["gumbel_tau"]
+            # set_graph_optimizer rebuilds graph_optimizer/graph_scheduler bound to the just-restored
+            # self.GT object (a fresh nn.Parameter, so any prior optimizer's reference is stale); the
+            # epoch argument only sets the initial lr, immediately overwritten by load_state_dict below.
+            self.set_graph_optimizer(0)
+            self.graph_optimizer.load_state_dict(ckpt["graph_optimizer_state"])
+            self.graph_scheduler.load_state_dict(ckpt["graph_scheduler_state"])
+            latent_pred_step = ckpt["latent_pred_step"]
+            graph_discov_step = ckpt["graph_discov_step"]
+            start_epoch = ckpt["epoch"] + 1
+            print(f"Resumed from checkpoint {checkpoint_path} at epoch {start_epoch}")
+        pbar = tqdm.tqdm(total=self.args.total_epoch, initial=start_epoch)
         data_interp = deepcopy(data)
         original_mask = deepcopy(observ_mask)
         auc = 0
-        for epoch_i in range(self.args.total_epoch):
+        for epoch_i in range(start_epoch, self.args.total_epoch):
 
             if self.args.group_policy is not None:
                 group_mul = int(self.args.group_policy.split("_")[1])
@@ -433,6 +464,27 @@ class MultiCAD(object):
 
             if epoch_callback is not None:
                 epoch_callback(epoch_i, Graph)
+
+            if checkpoint_path is not None and (epoch_i + 1) % checkpoint_every == 0:
+                # Written to a temp file then renamed (atomic on the same filesystem) so a checkpoint
+                # is never left half-written if the process is killed mid-save.
+                tmp_path = checkpoint_path + ".tmp"
+                torch.save({
+                    "epoch": epoch_i,
+                    "fitting_model_state": self.fitting_model.state_dict(),
+                    "data_pred_optimizer_state": self.data_pred_optimizer.state_dict(),
+                    "data_pred_scheduler_state": self.data_pred_scheduler.state_dict(),
+                    "graph_optimizer_state": self.graph_optimizer.state_dict(),
+                    "graph_scheduler_state": self.graph_scheduler.state_dict(),
+                    "n_groups": self.n_groups,
+                    "G": self.G.detach().cpu(),
+                    "GT": self.GT.detach().cpu(),
+                    "lambda_s": self.lambda_s,
+                    "gumbel_tau": self.gumbel_tau,
+                    "latent_pred_step": latent_pred_step,
+                    "graph_discov_step": graph_discov_step,
+                }, tmp_path)
+                os.replace(tmp_path, checkpoint_path)
 
             if (epoch_i+1) % self.args.show_graph_every == 0:
                 avg_mask = np.mean(observ_mask.cpu().numpy(), axis=(0,2))
