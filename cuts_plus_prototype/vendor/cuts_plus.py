@@ -1,5 +1,5 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Four deliberate deviations from upstream, kept as the only edits so this stays
+# see ../LICENSE). Five deliberate deviations from upstream, kept as the only edits so this stays
 # otherwise faithful to the source:
 #   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
 #      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
@@ -20,6 +20,15 @@
 #      than an edge probability - harmless to rank-based metrics (AUROC/AUPRC, quantile-based
 #      binarization) since sigmoid is monotonic, but confusing to read directly (negative values look
 #      like "inverse causation" when they just mean "logit < 0, i.e. probability < 0.5").
+#   5. Performance-only (same math, same results, no behavior change): MultiCAD.train() used to build
+#      every batch's actual tensors for the whole epoch via batch_generater() + list(...), because its
+#      two loops (data prediction, then graph discovery) need to see the identical batch grouping. That
+#      holds all of an epoch's batches in memory simultaneously, independent of --batch-size - OOM'd on
+#      a wide dataset (1352 channels) even at batch_size=2, since the fixed cost scales with the total
+#      number of training windows, not the batch size. generate_batch_index_groups() now plans the same
+#      grouping cheaply (a shuffled list of window-start integers), and materialize_batch() builds one
+#      batch's real tensors on demand inside each loop, so peak memory is one batch at a time - both
+#      loops still iterate the exact same index groups, so results are unchanged.
 
 import logging
 import os, sys
@@ -109,6 +118,31 @@ def batch_generater(data, observ_mask, bs, n_nodes, input_step, pred_step, block
         mask_y = observ_mask[y_idx].permute(0, 2, 1, 3)
 
         yield x, y, t_idx, mask_x, mask_y
+
+
+def generate_batch_index_groups(input_step, pred_step, t_length, bs, block_size=None):
+    """Plans which window-start indices belong to each batch for one epoch - cheap (a shuffled list
+    of plain Python ints), unlike materialize_batch's actual tensor gathering below. Returns a list
+    of bs-sized index lists, one per batch - see deviation 5."""
+    random_t_list = generate_indices(input_step, pred_step, t_length=t_length, block_size=block_size)
+    n_batches = len(random_t_list) // bs
+    return [random_t_list[i * bs:(i + 1) * bs] for i in range(n_batches)]
+
+
+def materialize_batch(data, observ_mask, t_idx_list, input_step, pred_step):
+    """Gathers one batch's x/y/mask_x/mask_y tensors from a plain list of window-start indices - the
+    same tensor construction batch_generater does per batch, factored out so it can be called fresh
+    for each batch instead of once for every batch in the epoch up front - see deviation 5."""
+    t_idx = torch.tensor(t_idx_list, device=data.device, dtype=torch.long)
+    x_offsets = torch.arange(-input_step, 0, device=data.device, dtype=torch.long)
+    y_offsets = torch.arange(0, pred_step, device=data.device, dtype=torch.long)
+    x_idx = t_idx.unsqueeze(1) + x_offsets.unsqueeze(0)
+    y_idx = t_idx.unsqueeze(1) + y_offsets.unsqueeze(0)
+    x = data[x_idx].permute(0, 2, 1, 3)
+    y = data[y_idx].permute(0, 2, 1, 3)
+    mask_x = observ_mask[x_idx].permute(0, 2, 1, 3)
+    mask_y = observ_mask[y_idx].permute(0, 2, 1, 3)
+    return x, y, t_idx, mask_x, mask_y
 
 
 
@@ -324,17 +358,22 @@ class MultiCAD(object):
                 else:
                     block_size = None
                 ##
-                batch_gen = batch_generater(data, observ_mask, # !!!!! TO-DO
-                                            bs=self.args.batch_size,
-                                            n_nodes=self.args.n_nodes,
-                                            input_step=self.args.input_step,
-                                            pred_step=self.args.data_pred.pred_step,
-                                            block_size=block_size)
-                batch_gen = list(batch_gen)
+                # perf patch: previously built every batch's actual x/y/mask tensors up front via
+                # batch_generater() + list(...), so the two loops below (S1, S2) could share the same
+                # batch grouping - but that means every batch in the epoch is held in memory at once,
+                # independent of --batch-size, which OOM's on a wide dataset (1352 channels) even at
+                # batch_size=2. generate_batch_index_groups() plans the same grouping cheaply (just
+                # window-start integers); materialize_batch() (called in each loop below) builds one
+                # batch's actual tensors on demand - see deviation 5.
+                batch_index_groups = generate_batch_index_groups(
+                    self.args.input_step, self.args.data_pred.pred_step, data.shape[0],
+                    bs=self.args.batch_size, block_size=block_size)
 
                 data_pred = deepcopy(data) # masked data points are predicted
                 data_pred_all = deepcopy(data)
-                for batch_idx, (x, y, t, mask_x, mask_y) in enumerate(batch_gen):
+                for batch_idx, t_idx_list in enumerate(batch_index_groups):
+                    x, y, t, mask_x, mask_y = materialize_batch(
+                        data, observ_mask, t_idx_list, self.args.input_step, self.args.data_pred.pred_step)
                     latent_pred_step += self.args.batch_size
                     y_pred, loss = self.latent_data_pred(x, y, mask_x, mask_y)
                     data_pred[t] = (y_pred*(1-mask_y) + y*mask_y).clone().detach()[:,:,0]
@@ -358,7 +397,9 @@ class MultiCAD(object):
 
             # Graph Discovery
             if hasattr(self.args, "graph_discov"):
-                for batch_idx, (x, y, t, mask_x, mask_y) in enumerate(batch_gen):
+                for batch_idx, t_idx_list in enumerate(batch_index_groups):
+                    x, y, t, mask_x, mask_y = materialize_batch(
+                        data, observ_mask, t_idx_list, self.args.input_step, self.args.data_pred.pred_step)
                     graph_discov_step += self.args.batch_size
                     if hasattr(self.args, "disable_graph") and self.args.disable_graph:
                         pass
