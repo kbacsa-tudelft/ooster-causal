@@ -95,6 +95,10 @@ class CUTSPlusRCAConfig:
     device: str = ''
     predict_chunk_size: int = 512  # windows per forward pass in predict_residuals; lower this if
     # scoring/validation OOMs at high channel counts (message passing is O(n_nodes^2) per window)
+    min_channel_observations: int = 1  # drop any channel with fewer real observations than this
+    # across all training sessions - also shrinks n_channels, which MultiCAD.train() multiplies by
+    # total training timesteps several times over for its GPU-resident copies of the whole dataset,
+    # so this is the main lever for fitting a wide, long-history dataset into limited GPU memory
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -541,18 +545,21 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
 
     train_data, train_mask = concat_sessions(series_dict, train_ids, boundary_gap=config.input_step)
 
-    # A channel with zero real observations across all training sessions has no train_mean, so
-    # fill_missing can't fill it (NaN stays NaN), which poisons the whole network's gradients within
-    # a step or two. Drop any such channel entirely - nothing can be learned about (or from) it if
-    # training never observed it once.
-    fully_missing = train_mask.sum(axis=0) == 0
-    if fully_missing.any():
-        dropped = [c for c, drop in zip(channel_names, fully_missing) if drop]
-        print(f'Dropping {len(dropped)} channel(s) with zero observations across all training '
-              f'sessions: {dropped}')
-        channel_names = [c for c, drop in zip(channel_names, fully_missing) if not drop]
-        train_data = train_data[:, ~fully_missing]
-        train_mask = train_mask[:, ~fully_missing]
+    # A channel with fewer real observations than min_channel_observations across all training
+    # sessions has too little (or no) signal to learn from - and at the default threshold of 1, no
+    # train_mean at all, so fill_missing can't fill it (NaN stays NaN), which poisons the whole
+    # network's gradients within a step or two. Drop any such channel entirely. Raising the threshold
+    # above 1 also trades away sparsely-observed channels to shrink n_channels - the main lever for
+    # fitting a wide dataset into limited GPU memory, since MultiCAD.train() multiplies it by total
+    # training timesteps several times over for its GPU-resident copies of the whole dataset.
+    sparse = train_mask.sum(axis=0) < config.min_channel_observations
+    if sparse.any():
+        dropped = [c for c, drop in zip(channel_names, sparse) if drop]
+        print(f'Dropping {len(dropped)} channel(s) with fewer than {config.min_channel_observations} '
+              f'observation(s) across all training sessions: {dropped}')
+        channel_names = [c for c, drop in zip(channel_names, sparse) if not drop]
+        train_data = train_data[:, ~sparse]
+        train_mask = train_mask[:, ~sparse]
 
     n_nodes = len(channel_names)
     boundary_cells = config.input_step * n_nodes * (len(train_ids) - 1)
@@ -575,7 +582,7 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     opt = build_opt(config, n_nodes)
     log = MyLogger(log_dir=os.path.join(os.getcwd(), config.log_dir, log_dir_name),
                     stdout=False, stderr=False, tensorboard=True)
-    log.log_metrics({'data/n_channels_dropped': int(fully_missing.sum()),
+    log.log_metrics({'data/n_channels_dropped': int(sparse.sum()),
                       'data/n_channels_used': n_nodes,
                       'data/train_missing_fraction': float(n_missing / train_data.size)}, 0)
 
@@ -651,7 +658,7 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     np.save(os.path.join(save_dir, 'cuts_plus_residual_median.npy'), median)
     np.save(os.path.join(save_dir, 'cuts_plus_residual_std.npy'), std)
     np.save(os.path.join(save_dir, 'cuts_plus_pot_thresholds.npy'), pot_thresholds)
-    # channel_names may differ from the dataset's raw column list (see the fully_missing drop above),
+    # channel_names may differ from the dataset's raw column list (see the sparse-channel drop above),
     # so the graph's row/column order can't always be recovered from the dataset alone.
     with open(os.path.join(save_dir, 'channel_names.json'), 'w') as fh:
         json.dump(channel_names, fh, indent=2)
