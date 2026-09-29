@@ -1,5 +1,5 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Six deliberate deviations from upstream, kept as the only edits so this stays
+# see ../LICENSE). Seven deliberate deviations from upstream, kept as the only edits so this stays
 # otherwise faithful to the source:
 #   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
 #      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
@@ -36,6 +36,20 @@
 #      it's loaded and training resumes right after the epoch it was saved at. Added for real-dataset
 #      runs long enough (hours) that losing all progress to an interruption is a real cost - a pure
 #      addition, no effect on any run that doesn't pass checkpoint_path.
+#   7. Performance-only (same math, same results, no behavior change): two more per-batch costs found
+#      after fixing LocalConv1D's kernel-launch storm (see the vendored model file's own deviation).
+#      First, latent_data_pred (S1) recomputed an O(n_nodes^2) Graph tensor (einsum + sigmoid) on
+#      every one of ~5,765 batches/epoch, even though self.GT/self.G never change during S1 (GT only
+#      updates via S2's graph_optimizer.step(), G only at group-refinement epoch boundaries) - now
+#      computed once per epoch (detached; this path never backpropped into GT/G anyway, since
+#      torch.bernoulli has no gradient w.r.t. its input) and passed into latent_data_pred instead of
+#      recomputed inside it. Second, materialize_batch rebuilt x_offsets/y_offsets (constant for the
+#      whole run) and re-converted each batch's index list to a tensor independently in both the S1
+#      and S2 calls for the same batch (~11,530 conversions/epoch instead of ~5,765) - both are now
+#      precomputed once per epoch/batch respectively and passed in. Also removed sample_multinorm, a
+#      nested function in latent_data_pred that was redefined on every S1 call but never actually
+#      called. Unlike deviation 6, this one does not change the model's state_dict or any checkpointed
+#      state's shape - a checkpoint saved before this change still loads and resumes correctly.
 
 import logging
 import os, sys
@@ -54,7 +68,6 @@ from omegaconf import OmegaConf
 from copy import deepcopy
 import torch
 from torch import dropout, nn
-import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import roc_curve, roc_auc_score
 
@@ -136,13 +149,14 @@ def generate_batch_index_groups(input_step, pred_step, t_length, bs, block_size=
     return [random_t_list[i * bs:(i + 1) * bs] for i in range(n_batches)]
 
 
-def materialize_batch(data, observ_mask, t_idx_list, input_step, pred_step):
-    """Gathers one batch's x/y/mask_x/mask_y tensors from a plain list of window-start indices - the
-    same tensor construction batch_generater does per batch, factored out so it can be called fresh
-    for each batch instead of once for every batch in the epoch up front - see deviation 5."""
-    t_idx = torch.tensor(t_idx_list, device=data.device, dtype=torch.long)
-    x_offsets = torch.arange(-input_step, 0, device=data.device, dtype=torch.long)
-    y_offsets = torch.arange(0, pred_step, device=data.device, dtype=torch.long)
+def materialize_batch(data, observ_mask, t_idx, x_offsets, y_offsets):
+    """Gathers one batch's x/y/mask_x/mask_y tensors from a precomputed window-start-index tensor and
+    offset tensors - the same tensor construction batch_generater does per batch, factored out so it
+    can be called fresh for each batch instead of once for every batch in the epoch up front - see
+    deviation 5. x_offsets/y_offsets depend only on input_step/pred_step (constant for the whole run),
+    so the caller computes them once per epoch instead of passing input_step/pred_step here to be
+    rebuilt on every call; t_idx is precomputed once per batch and shared between this batch's S1 and
+    S2 calls, instead of being converted from a Python list independently in each - see deviation 7."""
     x_idx = t_idx.unsqueeze(1) + x_offsets.unsqueeze(0)
     y_idx = t_idx.unsqueeze(1) + y_offsets.unsqueeze(0)
     x = data[x_idx].permute(0, 2, 1, 3)
@@ -211,26 +225,23 @@ class MultiCAD(object):
         self.graph_scheduler = torch.optim.lr_scheduler.StepLR(self.graph_optimizer, step_size=1, gamma=gamma)
 
 
-    def latent_data_pred(self, x, y, mask_x, mask_y):
+    def latent_data_pred(self, x, y, mask_x, mask_y, graph):
+        # graph is precomputed once per epoch by the caller (train()'s S1 loop), not recomputed here
+        # on every batch - see deviation 7. self.GT/self.G never change during S1 (only S2's
+        # graph_optimizer.step() updates GT; G only changes at group-refinement epoch boundaries,
+        # outside both batch loops), so graph's value would be identical on every call anyway; it's
+        # passed in detached, which is safe since torch.bernoulli has no gradient w.r.t. its input, so
+        # this path never needed to backprop into self.GT/self.G in the first place.
 
         def sample_bernoulli(sample_matrix, batch_size):
             sample_matrix = sample_matrix[None].expand(batch_size, -1, -1)
             return torch.bernoulli(sample_matrix).float()
 
-        def sample_multinorm(sample_matrix, batch_size):
-            sampled = torch.multinomial(sample_matrix, batch_size, replacement=True).T
-            return F.one_hot(sampled).float()
-
-
         bs, n, t, d = x.shape
         self.fitting_model.train()
         self.data_pred_optimizer.zero_grad()
 
-        GT_prob = self.GT
-        G_prob = self.G
-
-        Graph = torch.einsum("nm,ml->nl", G_prob, torch.sigmoid(GT_prob))
-        graph_sampled = sample_bernoulli(Graph, self.args.batch_size)
+        graph_sampled = sample_bernoulli(graph, self.args.batch_size)
 
         y_pred = self.fitting_model(x, mask_x, graph_sampled)
 
@@ -399,14 +410,27 @@ class MultiCAD(object):
                 batch_index_groups = generate_batch_index_groups(
                     self.args.input_step, self.args.data_pred.pred_step, data.shape[0],
                     bs=self.args.batch_size, block_size=block_size)
+                # perf patch (deviation 7): x_offsets/y_offsets depend only on input_step/pred_step
+                # (constant for the whole run) and each batch's t_idx tensor is shared between the S1
+                # and S2 loops below - all previously rebuilt inside materialize_batch on every one of
+                # the ~11,530 calls/epoch (once per batch per phase) despite never changing per-call.
+                batch_index_tensors = [torch.tensor(g, device=data.device, dtype=torch.long)
+                                       for g in batch_index_groups]
+                x_offsets = torch.arange(-self.args.input_step, 0, device=data.device, dtype=torch.long)
+                y_offsets = torch.arange(0, self.args.data_pred.pred_step, device=data.device, dtype=torch.long)
+                # S1's Graph never changes across an epoch's S1 batches (self.GT/self.G are read-only
+                # here - GT only updates via S2's graph_optimizer.step(), G only at group-refinement
+                # epoch boundaries), so compute it once instead of on every one of ~5,765 S1 batches.
+                # Detached: this path never backpropped into self.GT/self.G anyway (torch.bernoulli has
+                # no gradient w.r.t. its input), so this changes nothing about what gets learned.
+                s1_graph = torch.einsum("nm,ml->nl", self.G, torch.sigmoid(self.GT)).detach()
 
                 data_pred = deepcopy(data) # masked data points are predicted
                 data_pred_all = deepcopy(data)
-                for batch_idx, t_idx_list in enumerate(batch_index_groups):
-                    x, y, t, mask_x, mask_y = materialize_batch(
-                        data, observ_mask, t_idx_list, self.args.input_step, self.args.data_pred.pred_step)
+                for batch_idx, t_idx in enumerate(batch_index_tensors):
+                    x, y, t, mask_x, mask_y = materialize_batch(data, observ_mask, t_idx, x_offsets, y_offsets)
                     latent_pred_step += self.args.batch_size
-                    y_pred, loss = self.latent_data_pred(x, y, mask_x, mask_y)
+                    y_pred, loss = self.latent_data_pred(x, y, mask_x, mask_y, s1_graph)
                     data_pred[t] = (y_pred*(1-mask_y) + y*mask_y).clone().detach()[:,:,0]
                     data_pred_all[t] = y_pred.clone().detach()[:,:,0]
                     # perf patch: .item() is a blocking CPU/GPU sync - only pay for it every
@@ -428,9 +452,8 @@ class MultiCAD(object):
 
             # Graph Discovery
             if hasattr(self.args, "graph_discov"):
-                for batch_idx, t_idx_list in enumerate(batch_index_groups):
-                    x, y, t, mask_x, mask_y = materialize_batch(
-                        data, observ_mask, t_idx_list, self.args.input_step, self.args.data_pred.pred_step)
+                for batch_idx, t_idx in enumerate(batch_index_tensors):
+                    x, y, t, mask_x, mask_y = materialize_batch(data, observ_mask, t_idx, x_offsets, y_offsets)
                     graph_discov_step += self.args.batch_size
                     if hasattr(self.args, "disable_graph") and self.args.disable_graph:
                         pass
