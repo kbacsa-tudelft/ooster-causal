@@ -36,20 +36,24 @@
 #      it's loaded and training resumes right after the epoch it was saved at. Added for real-dataset
 #      runs long enough (hours) that losing all progress to an interruption is a real cost - a pure
 #      addition, no effect on any run that doesn't pass checkpoint_path.
-#   7. Performance-only (same math, same results, no behavior change): two more per-batch costs found
-#      after fixing LocalConv1D's kernel-launch storm (see the vendored model file's own deviation).
-#      First, latent_data_pred (S1) recomputed an O(n_nodes^2) Graph tensor (einsum + sigmoid) on
-#      every one of ~5,765 batches/epoch, even though self.GT/self.G never change during S1 (GT only
-#      updates via S2's graph_optimizer.step(), G only at group-refinement epoch boundaries) - now
-#      computed once per epoch (detached; this path never backpropped into GT/G anyway, since
-#      torch.bernoulli has no gradient w.r.t. its input) and passed into latent_data_pred instead of
-#      recomputed inside it. Second, materialize_batch rebuilt x_offsets/y_offsets (constant for the
-#      whole run) and re-converted each batch's index list to a tensor independently in both the S1
-#      and S2 calls for the same batch (~11,530 conversions/epoch instead of ~5,765) - both are now
-#      precomputed once per epoch/batch respectively and passed in. Also removed sample_multinorm, a
-#      nested function in latent_data_pred that was redefined on every S1 call but never actually
-#      called. Unlike deviation 6, this one does not change the model's state_dict or any checkpointed
-#      state's shape - a checkpoint saved before this change still loads and resumes correctly.
+#   7. Performance-only (same math, same results, no behavior change): several more per-batch/per-
+#      epoch costs found after fixing LocalConv1D's kernel-launch storm (see the vendored model file's
+#      own deviation). First, latent_data_pred (S1) recomputed an O(n_nodes^2) Graph tensor (einsum +
+#      sigmoid) on every one of ~5,765 batches/epoch, even though self.GT/self.G never change during
+#      S1 (GT only updates via S2's graph_optimizer.step(), G only at group-refinement epoch
+#      boundaries) - now computed once per epoch (detached; this path never backpropped into GT/G
+#      anyway, since torch.bernoulli has no gradient w.r.t. its input) and passed into
+#      latent_data_pred instead of recomputed inside it. Second, materialize_batch rebuilt
+#      x_offsets/y_offsets (constant for the whole run) and re-converted each batch's index list to a
+#      tensor independently in both the S1 and S2 calls for the same batch (~11,530 conversions/epoch
+#      instead of ~5,765) - both are now precomputed once per epoch/batch respectively and passed in.
+#      Third, data_pred_all (a full-dataset GPU clone, rebuilt and scatter-written on every S1 batch
+#      every epoch) is only ever read by a logging call gated behind show_graph_every - now only
+#      built/updated on epochs that will actually use it, via the same gating condition as the read
+#      site. Also removed sample_multinorm, a nested function in latent_data_pred that was redefined
+#      on every S1 call but never actually called. Unlike deviation 6, none of this changes the
+#      model's state_dict or any checkpointed state's shape - a checkpoint saved before this change
+#      still loads and resumes correctly.
 
 import logging
 import os, sys
