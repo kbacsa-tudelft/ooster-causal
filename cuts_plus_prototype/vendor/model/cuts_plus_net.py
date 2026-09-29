@@ -1,5 +1,16 @@
-# Vendored verbatim from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/model/cuts_plus_net.py
-# (MIT license, see ../LICENSE).
+# Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/model/cuts_plus_net.py
+# (MIT license, see ../LICENSE). One deliberate deviation from upstream, kept as the only edit so this
+# stays otherwise faithful to the source:
+#   1. Performance-only (same math, same results, no behavior change): LocalConv1D's forward used to
+#      loop over n_nodes in Python, calling one separate nn.Conv1d per node - each node's independent
+#      (kernel_size=1) affine map stayed mathematically independent (no weight sharing across nodes,
+#      identical capacity), but was computed as n_nodes separate tiny CUDA kernel launches. On real
+#      workloads (n_nodes~490, called thousands of times/epoch via CUTS_Plus_Net's S1/data-prediction
+#      and S2/graph-discovery training loops in vendor/cuts_plus.py), this Python-loop kernel-launch
+#      overhead was the dominant cost of an observed ~30 min/epoch. Reimplemented using a single
+#      grouped nn.Conv1d (groups=n_nodes) that computes the same n_nodes independent affine maps in
+#      one fused kernel launch - see tests/test_local_conv1d_equivalence.py for a numerical
+#      equivalence check (forward and backward) against the original per-node-loop algorithm.
 
 import torch
 from einops import rearrange
@@ -55,18 +66,25 @@ class MPNN(nn.Module):
 class LocalConv1D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, n_nodes):
         super(LocalConv1D, self).__init__()
+        assert kernel_size == 1, (
+            "grouped-conv LocalConv1D only supports kernel_size=1 (the only value ever "
+            "instantiated in this codebase - larger kernels can't slide over the length-1 "
+            "input this layer always receives)"
+        )
         self.out_channel = out_channels
-        self.conv_list = nn.ModuleList([
-            nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size) for _ in range(n_nodes)
-        ])
-    
+        self.n_nodes = n_nodes
+        self.grouped_conv = nn.Conv1d(
+            in_channels=in_channels * n_nodes,
+            out_channels=out_channels * n_nodes,
+            kernel_size=1,
+            groups=n_nodes,
+        )
+
     def forward(self, x): # x: [batch, features, nodes]
         b, h, n = x.shape
-        out = torch.zeros((b, self.out_channel, n)).to(x.device)
-        for i in range(n):
-            x_local_in = x[..., i].unsqueeze(-1)
-            x_local_out = self.conv_list[i](x_local_in)
-            out[..., i] = x_local_out.squeeze(-1)
+        x_node_major = x.permute(0, 2, 1).reshape(b, n * h, 1)  # node-major channel layout
+        out = self.grouped_conv(x_node_major)                   # [b, n*out_channel, 1]
+        out = out.reshape(b, n, self.out_channel).permute(0, 2, 1)
         return out
 
 

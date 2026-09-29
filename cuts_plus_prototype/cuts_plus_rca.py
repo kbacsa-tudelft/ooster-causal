@@ -441,6 +441,8 @@ def run_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_plus_rca')
     directly without going through argparse."""
     set_seed(config.seed)
     device = config.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True  # fixed batch shapes throughout training
 
     x, causal_struct_value, labels, clean_len = make_synthetic_series(config)
     val_len = int(config.val_ratio * len(x))
@@ -530,6 +532,8 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     the held-out sessions - saving flagged anomalies and the learned causal graph to save_dir."""
     set_seed(config.seed)
     device = config.device or ('cuda' if torch.cuda.is_available() else 'cpu')
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True  # fixed batch shapes throughout training
 
     series_dict, means, stds = load_real_sessions(config.data_dir)
     session_ids = sorted(series_dict.keys())
