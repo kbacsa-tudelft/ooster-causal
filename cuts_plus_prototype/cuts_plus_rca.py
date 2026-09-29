@@ -105,6 +105,17 @@ class CUTSPlusRCAConfig:
     # epochs (real-data pipeline only) - rerunning the same command (same --save-dir) after an
     # interruption resumes from it automatically, with no separate --resume flag needed
 
+    # K-fold cross-validation over the training-eligible session pool (val/score sessions are
+    # completely unaffected). Used to assess how consistently the same causal edges get (re)discovered
+    # when trained on different, overlapping subsets of sessions - an empirical confidence signal in
+    # place of a ground-truth graph. n_folds=1 (default) disables k-fold entirely: byte-for-byte
+    # identical to the single-training-set behavior. Combine with sweep.py (--sweep fold=0,1,...,K-1
+    # --n-folds K --resume) to orchestrate all K folds sequentially with automatic resume, then
+    # aggregate_kfold_graphs.py to combine the resulting graphs.
+    n_folds: int = 1
+    fold: int = 0  # which of the n_folds stripes to EXCLUDE from training this run (0-indexed);
+    # must satisfy 0 <= fold < n_folds
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Train CUTS+ + root-cause-analysis on synthetic data.')
@@ -162,6 +173,27 @@ def load_real_sessions(data_dir: str):
             f'(at least one each for training, threshold-fitting, and scoring).'
         )
     return series_dict, means, stds
+
+
+def split_sessions_for_fold(pool_ids: list, n_folds: int, fold: int) -> list:
+    """Returns pool_ids with fold's interleaved stripe (pool_ids[fold::n_folds]) excluded - i.e. this
+    fold's training set. Striping (not contiguous blocks) is deliberate: pool_ids is chronologically
+    sorted, and a contiguous slice would systematically remove one whole calendar span (a season, a
+    weather regime) from that fold's training set - confounding cross-fold disagreement with regime
+    differences rather than measuring genuine causal-discovery instability. n_folds=1 returns pool_ids
+    unchanged (no stripe held out)."""
+    if n_folds == 1:
+        return list(pool_ids)
+    held_out = set(pool_ids[fold::n_folds])
+    return [sid for sid in pool_ids if sid not in held_out]
+
+
+def compute_sparse_mask(mask_for_sparsity: np.ndarray, min_channel_availability: float):
+    """Returns (sparse: bool array, min_count: int) - which channels are observed in fewer than
+    min_channel_availability of mask_for_sparsity's rows (always at least 1 real observation required,
+    regardless of how low min_channel_availability is set - see run_real_data_pipeline)."""
+    min_count = max(1, round(min_channel_availability * mask_for_sparsity.shape[0]))
+    return mask_for_sparsity.sum(axis=0) < min_count, min_count
 
 
 def concat_sessions(series_dict: dict, session_ids: list, boundary_gap: int):
@@ -544,15 +576,24 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
             f'Only {len(session_ids)} sessions found in {config.data_dir}; need more than '
             f'val+score ({n_val}+{n_score}) so at least one whole session is left for training.'
         )
-    train_ids = session_ids[:-(n_val + n_score)]
+    if config.n_folds < 1:
+        raise ValueError(f'--n-folds must be >= 1 (got {config.n_folds}).')
+    if not (0 <= config.fold < config.n_folds):
+        raise ValueError(
+            f'--fold ({config.fold}) must satisfy 0 <= fold < --n-folds ({config.n_folds}).'
+        )
+
+    pool_ids = session_ids[:-(n_val + n_score)]
     val_ids = session_ids[-(n_val + n_score):-n_score]
     score_ids = session_ids[-n_score:]
+    train_ids = split_sessions_for_fold(pool_ids, config.n_folds, config.fold)
+    if config.n_folds > 1:
+        print(f'K-fold: {config.n_folds} folds, fold {config.fold} withholds '
+              f'{len(pool_ids) - len(train_ids)} of {len(pool_ids)} training-eligible sessions.')
     print(f'Sessions: {len(train_ids)} train, {len(val_ids)} val, {len(score_ids)} score '
           f'(out of {len(session_ids)} total)')
 
     channel_names = list(series_dict[session_ids[0]].columns)
-
-    train_data, train_mask = concat_sessions(series_dict, train_ids, boundary_gap=config.input_step)
 
     # A channel observed in less than min_channel_availability of training rows has too little (or
     # no) signal to learn from - and with zero real observations, no train_mean at all, so
@@ -562,13 +603,28 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     # 0 also trades away sparsely-observed channels to shrink n_channels - the main lever for fitting
     # a wide dataset into limited GPU memory, since MultiCAD.train() multiplies it by total training
     # timesteps several times over for its GPU-resident copies of the whole dataset.
-    min_count = max(1, round(config.min_channel_availability * train_mask.shape[0]))
-    sparse = train_mask.sum(axis=0) < min_count
+    #
+    # For k-fold (n_folds > 1), which channels survive must be decided once from the full training-
+    # eligible pool, not from this fold's own (smaller) train_ids - otherwise folds could disagree
+    # about which channels are sparse, and cuts_plus_graph.npy's row/column i wouldn't mean the same
+    # channel across folds, silently breaking any cross-fold aggregation.
+    if config.n_folds > 1:
+        pool_data, pool_mask = concat_sessions(series_dict, pool_ids, boundary_gap=config.input_step)
+        sparse, min_count = compute_sparse_mask(pool_mask, config.min_channel_availability)
+        sparsity_rows = pool_mask.shape[0]
+        del pool_data, pool_mask
+        train_data, train_mask = concat_sessions(series_dict, train_ids, boundary_gap=config.input_step)
+        scope = f'{sparsity_rows} pool rows shared by all {config.n_folds} folds'
+    else:
+        train_data, train_mask = concat_sessions(series_dict, train_ids, boundary_gap=config.input_step)
+        sparse, min_count = compute_sparse_mask(train_mask, config.min_channel_availability)
+        scope = f'{train_mask.shape[0]} training rows'
+
     if sparse.any():
         dropped = [c for c, drop in zip(channel_names, sparse) if drop]
         print(f'Dropping {len(dropped)} channel(s) with fewer than {min_count} observation(s) '
-              f'({config.min_channel_availability:.1%} of {train_mask.shape[0]} training rows) '
-              f'across all training sessions: {dropped}')
+              f'({config.min_channel_availability:.1%} of {scope}) across all training sessions: '
+              f'{dropped}')
         channel_names = [c for c, drop in zip(channel_names, sparse) if not drop]
         train_data = train_data[:, ~sparse]
         train_mask = train_mask[:, ~sparse]

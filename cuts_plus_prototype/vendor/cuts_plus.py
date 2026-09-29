@@ -1,5 +1,5 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Seven deliberate deviations from upstream, kept as the only edits so this stays
+# see ../LICENSE). Eight deliberate deviations from upstream, kept as the only edits so this stays
 # otherwise faithful to the source:
 #   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
 #      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
@@ -54,6 +54,14 @@
 #      on every S1 call but never actually called. Unlike deviation 6, none of this changes the
 #      model's state_dict or any checkpointed state's shape - a checkpoint saved before this change
 #      still loads and resumes correctly.
+#   8. Bug fix (found while testing k-fold resume, deviation 6): if a checkpoint was saved at the
+#      final epoch and the process was interrupted before train() returned/saved its result, resuming
+#      set start_epoch == total_epoch, so the epoch loop ran zero times - and Graph, only ever assigned
+#      inside that loop, was never defined, crashing the `return Graph` at the end of this function
+#      with UnboundLocalError. Graph is now also computed once, from self.G/self.GT, right after a
+#      checkpoint is (or isn't) loaded - harmless in the normal case, since the loop's own per-epoch
+#      computation is identical and immediately overwrites it; only the zero-iterations case actually
+#      relies on this value.
 
 import logging
 import os, sys
@@ -329,6 +337,18 @@ class MultiCAD(object):
             graph_discov_step = ckpt["graph_discov_step"]
             start_epoch = ckpt["epoch"] + 1
             print(f"Resumed from checkpoint {checkpoint_path} at epoch {start_epoch}")
+        # Bug fix: if start_epoch >= total_epoch (a checkpoint saved at the last epoch, then
+        # interrupted before this function returned/saved its result), the epoch loop below runs zero
+        # times, and Graph - only ever assigned inside that loop - was never defined, crashing the
+        # `return Graph` at the end of this function with UnboundLocalError. Since the loop's own
+        # per-epoch computation of Graph from self.G/self.GT is idempotent (recomputed fresh from
+        # current state each epoch, not accumulated), doing that same computation once up front covers
+        # the zero-iterations case and is harmless (immediately overwritten) otherwise.
+        Graph = None
+        if hasattr(self, "GT"):
+            G_prob = self.G.detach().cpu().numpy()
+            GT_prob = torch.sigmoid(self.GT).detach().cpu().numpy()
+            Graph = np.einsum("nm,ml->nl", G_prob, GT_prob)
         pbar = tqdm.tqdm(total=self.args.total_epoch, initial=start_epoch)
         data_interp = deepcopy(data)
         original_mask = deepcopy(observ_mask)
