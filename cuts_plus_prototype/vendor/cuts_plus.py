@@ -425,14 +425,20 @@ class MultiCAD(object):
                 # no gradient w.r.t. its input), so this changes nothing about what gets learned.
                 s1_graph = torch.einsum("nm,ml->nl", self.G, torch.sigmoid(self.GT)).detach()
 
+                # perf patch (deviation 7): data_pred_all is only ever read by log_time_series below,
+                # itself gated by show_graph_every - building the full-dataset clone and scatter-
+                # writing into it on every S1 batch was pure waste on the (typically vast majority of)
+                # epochs that won't actually use it.
+                need_data_pred_all = (epoch_i + 1) % self.args.show_graph_every == 0
                 data_pred = deepcopy(data) # masked data points are predicted
-                data_pred_all = deepcopy(data)
+                data_pred_all = deepcopy(data) if need_data_pred_all else None
                 for batch_idx, t_idx in enumerate(batch_index_tensors):
                     x, y, t, mask_x, mask_y = materialize_batch(data, observ_mask, t_idx, x_offsets, y_offsets)
                     latent_pred_step += self.args.batch_size
                     y_pred, loss = self.latent_data_pred(x, y, mask_x, mask_y, s1_graph)
                     data_pred[t] = (y_pred*(1-mask_y) + y*mask_y).clone().detach()[:,:,0]
-                    data_pred_all[t] = y_pred.clone().detach()[:,:,0]
+                    if need_data_pred_all:
+                        data_pred_all[t] = y_pred.clone().detach()[:,:,0]
                     # perf patch: .item() is a blocking CPU/GPU sync - only pay for it every
                     # LOG_EVERY_N_BATCHES batches, and only once (previously called twice for the
                     # same value: once for logging, once for the progress bar).

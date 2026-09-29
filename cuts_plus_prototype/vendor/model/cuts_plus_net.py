@@ -1,6 +1,6 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/model/cuts_plus_net.py
-# (MIT license, see ../LICENSE). One deliberate deviation from upstream, kept as the only edit so this
-# stays otherwise faithful to the source:
+# (MIT license, see ../LICENSE). Two deliberate deviations from upstream, kept as the only edits so
+# this stays otherwise faithful to the source:
 #   1. Performance-only (same math, same results, no behavior change): LocalConv1D's forward used to
 #      loop over n_nodes in Python, calling one separate nn.Conv1d per node - each node's independent
 #      (kernel_size=1) affine map stayed mathematically independent (no weight sharing across nodes,
@@ -11,6 +11,16 @@
 #      grouped nn.Conv1d (groups=n_nodes) that computes the same n_nodes independent affine maps in
 #      one fused kernel launch - see tests/test_local_conv1d_equivalence.py for a numerical
 #      equivalence check (forward and backward) against the original per-node-loop algorithm.
+#   2. Performance-only (same math, same results, no behavior change): GRUCell.forward calls three
+#      separate MPNN instances (forget_gate, update_gate, c_gate) with the same x/adj, and each used to
+#      independently recompute the O(n_nodes^2) all-pairs "x_messages" tensor (an expand + einsum) from
+#      scratch - but that computation depends only on x/adj, never on h, so all three gates were
+#      computing the exact same tensor three times per GRU step (at n_nodes~1352, ~936 MB, three times
+#      per batch in both training phases). Factored the shared computation out into a module-level
+#      compute_messages() helper, called once per GRUCell.forward and passed into each MPNN.forward
+#      (which now takes the precomputed messages instead of raw x/graph) - see
+#      tests/test_gru_cell_equivalence.py for a numerical equivalence check against the original
+#      redundant-per-gate computation.
 
 import torch
 from einops import rearrange
@@ -34,12 +44,25 @@ class GRUCell(nn.Module):
         :param adj: (num_nodes, num_nodes)
         :return:
         """
+        # x_messages depends only on x/adj (never h), so it's shared across all three gates below -
+        # compute once instead of once per gate. See deviation 2 in this file's header comment.
+        x_messages = compute_messages(x, adj)
         # we start with bias 1.0 to not reset and not update
-        r = torch.sigmoid(self.forget_gate(x, h, adj))
-        u = torch.sigmoid(self.update_gate(x, h, adj))
-        c = self.c_gate(x, r * h, adj)  # batch_size, self._num_nodes * output_size
+        r = torch.sigmoid(self.forget_gate(x_messages, h))
+        u = torch.sigmoid(self.update_gate(x_messages, h))
+        c = self.c_gate(x_messages, r * h)  # batch_size, self._num_nodes * output_size
         c = self.activation_fn(c)
         return u * h + (1. - u) * c
+
+
+def compute_messages(x, graph):
+    """The all-pairs message tensor MPNN.forward used to compute internally on every call - factored
+    out so GRUCell can compute it once and share it across its three gates (see deviation 2)."""
+    b, c, n = x.shape
+    x_repeat = x[:, :, :, None].expand(-1, -1, -1, n) # [b, c, n, n]
+    x_messages = torch.einsum('bcmn,bmn->bcmn', (x_repeat, graph))
+    x_messages = rearrange(x_messages, 'b c m n -> b (c m) n')
+    return x_messages
 
 
 class MPNN(nn.Module):
@@ -47,15 +70,8 @@ class MPNN(nn.Module):
         super(MPNN, self).__init__()
         self.concat_h = concat_h
         self.mlp = nn.Conv1d(c_in, c_out, kernel_size=1)
-        
-    def forward(self, x, h, graph):
-        b, c, n = x.shape
-        
-        x_repeat = x[:, :, :, None].expand(-1, -1, -1, n) # [b, c, n, n]
-        # graph = rearrange(graph, 'b n m -> b m n')
-        x_messages = torch.einsum('bcmn,bmn->bcmn', (x_repeat, graph))
-        x_messages = rearrange(x_messages, 'b c m n -> b (c m) n')
-        
+
+    def forward(self, x_messages, h):
         if self.concat_h:
             out = self.mlp(torch.cat([x_messages, h], dim=1))
         else:
