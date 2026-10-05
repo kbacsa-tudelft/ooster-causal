@@ -278,10 +278,11 @@ def main():
     rws_files = sorted(glob.glob(os.path.join(args.rws_dir, '*.parquet')))
     print(f'full: {len(full_files)} sessions, rws: {len(rws_files)} sessions')
 
-    full_cov = coverage(full_files, 'two_week_chunks_full')
+    full_label = os.path.basename(os.path.normpath(args.full_dir))
+    full_cov = coverage(full_files, full_label)
     rws_cov = coverage(rws_files, 'rws_data')
 
-    full_stats = per_channel_stats(full_files, 'two_week_chunks_full')
+    full_stats = per_channel_stats(full_files, full_label)
     rws_stats = per_channel_stats(rws_files, 'rws_data')
     stats = pd.concat([full_stats, rws_stats], ignore_index=True)
     stats.to_csv(os.path.join(args.output, 'per_channel_stats.csv'), index=False)
@@ -327,7 +328,7 @@ def main():
 
     thr_rows = []
     for t in args.availability_thresholds:
-        for label, st in [('two_week_chunks_full', full_stats), ('rws_data', rws_stats)]:
+        for label, st in [(full_label, full_stats), ('rws_data', rws_stats)]:
             kept = int((st['availability'] >= t).sum())
             thr_rows.append({'threshold': t, 'dataset': label, 'channels_kept': kept, 'channels_total': len(st)})
 
@@ -357,7 +358,7 @@ def main():
             median_availability=('availability', 'median'),
             median_constant_share=('constant_session_share', 'median'),
             discharge_like=('discharge_like', 'sum')).reset_index().to_html(index=False) +
-        '<h3>Full-dataset channels</h3>' + full_stats.round(4).to_html(index=False))))
+        f'<h3>{full_label} channels</h3>' + full_stats.round(4).to_html(index=False))))
     sections.append(('4. Value agreement on matched stations (overlap window)', (
         '<p>Full series minus rws series after resampling both to a 10-min mean. corr is over the joined '
         'timestamps; bias is mean(full - rws).</p>' +
