@@ -312,18 +312,49 @@ def main():
 
     full_loc = load_locations(args.full_locations, 'rd')
     rws_loc = load_locations(args.rws_locations, 'latlon')
+    rws_loc = rws_loc[rws_loc['name'].isin(set(rws_stats['channel']))].reset_index(drop=True)
+
     def loc_name(channel: str) -> str:
         # locations.csv keeps the suffix for water level (e.g. 'BG2_observed_waterlevel') and uses
         # rain channel names as-is, matching plot_causal_map.load_locations.
         return channel[len('WL_'):] if channel.startswith('WL_') else channel
 
-    wanted = {loc_name(c) for c in unmatched + full_rh}
-    candidates = nearest_rws(full_loc[full_loc['name'].isin(wanted)], rws_loc, args.match_radius_m)
+    chan_by_loc = {loc_name(c): c for c in full_wl + full_rh}
+    near = nearest_rws(full_loc[full_loc['name'].isin(set(chan_by_loc))], rws_loc, args.match_radius_m)
+    near['full_chan'] = near['full_name'].map(chan_by_loc)
+
+    # Coordinates are the primary matching key; names are only a cross-check.
+    name_hit = {}
+    for c in full_wl:
+        key = normalize_station(c)
+        hit = rws_norm.get(key)
+        if hit is None:
+            for alias in ALIASES.get(key, []):
+                if alias in rws_norm:
+                    hit = rws_norm[alias]
+                    break
+        name_hit[c] = hit
+
+    matches = []
+    for _, r in near.iterrows():
+        c = r['full_chan']
+        if not c.startswith('WL_') or not r['within_radius']:
+            continue
+        matches.append({'full_chan': c, 'rws_chan': r['nearest_rws'], 'distance_m': round(r['distance_m'], 1),
+                        'name_agrees': name_hit.get(c) == r['nearest_rws'],
+                        'name_candidate': name_hit.get(c) or ''})
+    coord_matched = {m['full_chan'] for m in matches}
+    unmatched = [c for c in full_wl if c not in coord_matched]
+    name_only = [c for c in full_wl if name_hit.get(c)]
+
+    candidates = near[~near['full_chan'].isin(coord_matched) | ~near['full_chan'].str.startswith('WL_')]
+    candidates = candidates[['full_chan', 'nearest_rws', 'distance_m', 'within_radius']]
 
     agreements = []
     for m in matches:
         ag = value_agreement(full_files, rws_overlap, m['full_chan'], m['rws_chan'])
-        ag.update(full_chan=m['full_chan'], rws_chan=m['rws_chan'], how=m['how'])
+        ag.update(full_chan=m['full_chan'], rws_chan=m['rws_chan'], how='coordinate',
+                  distance_m=m['distance_m'], name_agrees=m['name_agrees'])
         agreements.append(ag)
 
     thr_rows = []
@@ -333,7 +364,7 @@ def main():
             thr_rows.append({'threshold': t, 'dataset': label, 'channels_kept': kept, 'channels_total': len(st)})
 
     ag_table = pd.DataFrame([{k: (round(v, 4) if isinstance(v, float) else v) for k, v in a.items()
-                              if k in ('full_chan', 'rws_chan', 'how', 'n', 'corr', 'rmse', 'bias')}
+                              if k in ('full_chan', 'rws_chan', 'distance_m', 'name_agrees', 'n', 'corr', 'rmse', 'bias')}
                              for a in agreements]) if agreements else pd.DataFrame()
 
     sections = []
@@ -343,12 +374,12 @@ def main():
         | {'cadence': json.dumps(c['cadence_per_session']), 'timezones': ','.join(c['timezones'])}
         for c in (full_cov, rws_cov)]).to_html(index=False)))
     sections.append(('2. Station overlap', (
-        '<h3>Matched water-level channels</h3>' + (pd.DataFrame(matches).to_html(index=False)
+        '<h3>Water-level channels matched by coordinates (within radius; names used as a cross-check)</h3>' + (pd.DataFrame(matches).to_html(index=False)
                                                   if matches else '<p>none</p>') +
-        '<h3>Unmatched full-dataset water-level channels</h3>' + (
+        '<h3>Water-level channels with no rws station within the radius</h3>' + (
             '<p>' + ', '.join(unmatched) + '</p>' if unmatched else '<p>none</p>') +
         '<h3>Rainfall channels (no rws counterpart by construction)</h3><p>' + ', '.join(full_rh) + '</p>' +
-        '<h3>Nearest rws site by coordinates (candidates only, not matches)</h3>' +
+        '<h3>Nearest rws site for rainfall channels and unmatched water-level channels (candidates only)</h3>' +
         candidates.to_html(index=False))))
     sections.append(('3. Per-channel statistics', (
         '<p>Full table in per_channel_stats.csv. Discharge-like = max value &ge; '
@@ -359,7 +390,7 @@ def main():
             median_constant_share=('constant_session_share', 'median'),
             discharge_like=('discharge_like', 'sum')).reset_index().to_html(index=False) +
         f'<h3>{full_label} channels</h3>' + full_stats.round(4).to_html(index=False))))
-    sections.append(('4. Value agreement on matched stations (overlap window)', (
+    sections.append(('4. Value agreement on coordinate-matched stations (overlap window)', (
         '<p>Full series minus rws series after resampling both to a 10-min mean. corr is over the joined '
         'timestamps; bias is mean(full - rws).</p>' +
         (ag_table.to_html(index=False) if len(ag_table) else '<p>no matched stations with overlapping data</p>'))))
@@ -372,7 +403,7 @@ def main():
     with open(os.path.join(args.output, 'eda_report.html'), 'w') as fh:
         fh.write(html_report(sections, figs))
     print(f"Wrote {os.path.join(args.output, 'eda_report.html')}")
-    print(f'matched WL: {len(matches)} ({[m["full_chan"] for m in matches]}), unmatched WL: {len(unmatched)}, '
+    print(f'coordinate-matched WL: {len(matches)}, name-matched WL: {len(name_only)}, unmatched WL: {len(unmatched)}, '
           f'rain channels: {len(full_rh)}')
 
 
