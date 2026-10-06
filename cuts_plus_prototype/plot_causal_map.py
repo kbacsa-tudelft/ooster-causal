@@ -79,7 +79,8 @@ def load_locations(locations_csv: str, channel_names: list, rain_shift_m: float)
     return coords
 
 
-def strongest_edges(graph: np.ndarray, channel_names: list, coords: dict, top_k: int) -> list:
+def strongest_edges(graph: np.ndarray, channel_names: list, coords: dict, top_k: int,
+                    min_weight: float = 0.0) -> list:
     """Returns [(weight, effect_name, cause_name), ...], strongest first, restricted to edges
     where both endpoints have a known location and the effect is a WL_* (water-level) channel -
     a WL_* or RH_* cause's effect on rainfall isn't the physically interesting relationship here,
@@ -95,13 +96,14 @@ def strongest_edges(graph: np.ndarray, channel_names: list, coords: dict, top_k:
             effect, cause = channel_names[i], channel_names[j]
             if not effect.startswith('WL_'):
                 continue
-            if effect in coords and cause in coords:
+            if effect in coords and cause in coords and edge_strength[i, j] >= min_weight:
                 pairs.append((edge_strength[i, j], effect, cause))
     pairs.sort(key=lambda p: p[0], reverse=True)
     return pairs[:top_k]
 
 
-def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict) -> list:
+def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict,
+                                min_weight: float = 0.0) -> list:
     """For each node acting as a cause (source), keeps only its single strongest outgoing edge (to
     whichever effect it influences most). Only WL_* (water-level) effects are considered, regardless
     of the source's type - a cause's effect on rainfall isn't the physically interesting
@@ -126,13 +128,14 @@ def strongest_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: 
                 continue  # only consider water-level effects
             if edge_strength[i, j] > best_w:
                 best_i, best_w = i, edge_strength[i, j]
-        if best_i is not None:
+        if best_i is not None and best_w >= min_weight:
             pairs.append((best_w, channel_names[best_i], cause))
     pairs.sort(key=lambda p: p[0], reverse=True)
     return pairs
 
 
-def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict, top_n: int) -> dict:
+def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict, top_n: int,
+                            min_weight: float = 0.0) -> dict:
     """For each node acting as a cause (source), its top_n strongest outgoing edges (to other
     located nodes). Only WL_* (water-level) effects are considered, regardless of the source's type
     (same restriction as strongest_outgoing_per_node, generalized to top_n). Returns
@@ -152,7 +155,7 @@ def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict
             effect = channel_names[i]
             if effect not in coords:
                 continue
-            if not effect.startswith('WL_'):
+            if not effect.startswith('WL_') or edge_strength[i, j] < min_weight:
                 continue
             candidates.append((edge_strength[i, j], effect))
         candidates.sort(reverse=True)
@@ -160,12 +163,13 @@ def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict
     return result
 
 
-def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coords: dict, top_n: int):
+def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coords: dict, top_n: int,
+                    min_weight: float = 0.0):
     """Plots every located node; hovering one draws its top_n strongest outgoing edges as animated
     dashed lines (color matches the source: blue for rainfall, red for water level), removed on
     mouseout. All interactivity runs client-side (embedded JS), since the graph the user hovers is
     fixed at render time - no server round-trip needed."""
-    top_edges = top_n_outgoing_per_node(graph, channel_names, coords, top_n)
+    top_edges = top_n_outgoing_per_node(graph, channel_names, coords, top_n, min_weight)
 
     marker_vars = []
     for name, (lat, lon) in coords.items():
@@ -254,7 +258,7 @@ window.addEventListener('load', function() {{
 
 
 def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, top_k: int,
-              rain_shift_m: float, mode: str = 'top-k', top_n: int = 5):
+              rain_shift_m: float, mode: str = 'top-k', top_n: int = 5, min_weight: float = 0.0):
     graph = np.load(graph_path)
     channel_names = load_channel_names(data_dir, graph_path)
     if graph.shape != (len(channel_names), len(channel_names)):
@@ -278,17 +282,23 @@ def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, t
     )
 
     if mode == 'hover':
-        build_hover_map(m, graph, channel_names, coords, top_n)
+        build_hover_map(m, graph, channel_names, coords, top_n, min_weight)
         m.save(output)
         print(f'Wrote {output}')
         return
 
     if mode == 'per-node-outgoing':
-        edges = strongest_outgoing_per_node(graph, channel_names, coords)
+        edges = strongest_outgoing_per_node(graph, channel_names, coords, min_weight)
     else:
-        edges = strongest_edges(graph, channel_names, coords, top_k)
+        edges = strongest_edges(graph, channel_names, coords, top_k, min_weight)
     if not edges:
-        raise ValueError('No edges to plot - no two located channels have a scored edge.')
+        # a threshold above every edge weight leaves nothing to draw: keep the map with its nodes
+        print(f'WARNING: no edges with weight >= {min_weight}; the map shows nodes only')
+        for name, (lat, lon) in coords.items():
+            folium.CircleMarker(location=[lat, lon], radius=4, tooltip=name).add_to(m)
+        m.save(output)
+        print(f'Wrote {output}: {len(coords)} nodes, 0 edges plotted')
+        return
 
     for name, (lat, lon) in coords.items():
         is_rain = name.startswith('RH_')
@@ -341,9 +351,11 @@ def main():
                          help='meters to shift RH_* (rainfall) stations north before plotting')
     parser.add_argument('--top-n', type=int, default=5,
                          help='number of outgoing edges to show per node on hover (--mode hover only)')
+    parser.add_argument('--min-weight', type=float, default=0.0,
+                         help='drop edges weaker than this (all modes); 0 keeps every edge')
     args = parser.parse_args()
     build_map(args.graph, args.data_dir, args.locations_csv, args.output, args.top_k,
-              args.rain_shift_m, args.mode, args.top_n)
+              args.rain_shift_m, args.mode, args.top_n, args.min_weight)
 
 
 if __name__ == '__main__':
