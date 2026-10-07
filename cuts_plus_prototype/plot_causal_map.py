@@ -8,7 +8,8 @@ map from a water-level sensor.
 
 --mode hover plots only nodes up front; hovering one animates its top --top-n strongest outgoing
 edges in instead of drawing every edge at once, which is far more legible once the node count gets
-large.
+large. --mode hover-incoming is the reverse: hovering a water-level node shows its top --top-n
+strongest causes instead - which stations most drive that one.
 
 Channels missing from locations.csv (and any edge touching one) are skipped and reported - not
 silently dropped.
@@ -163,13 +164,45 @@ def top_n_outgoing_per_node(graph: np.ndarray, channel_names: list, coords: dict
     return result
 
 
+def top_n_incoming_per_node(graph: np.ndarray, channel_names: list, coords: dict, top_n: int,
+                            min_weight: float = 0.0) -> dict:
+    """For each node acting as an effect (only WL_* nodes have effects evaluated at all, matching
+    this script's rule that rainfall is never an effect), its top_n strongest incoming edges from
+    other located nodes of either type. Returns {effect_name: [(cause_name, weight), ...]},
+    strongest first - the reverse of top_n_outgoing_per_node."""
+    edge_strength = graph.copy()
+    np.fill_diagonal(edge_strength, 0.0)
+    n = len(channel_names)
+    result = {}
+    for i in range(n):
+        effect = channel_names[i]
+        if effect not in coords or not effect.startswith('WL_'):
+            continue
+        candidates = []
+        for j in range(n):
+            if i == j:
+                continue
+            cause = channel_names[j]
+            if cause not in coords or edge_strength[i, j] < min_weight:
+                continue
+            candidates.append((edge_strength[i, j], cause))
+        candidates.sort(reverse=True)
+        result[effect] = [(cause, float(w)) for w, cause in candidates[:top_n]]
+    return result
+
+
 def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coords: dict, top_n: int,
-                    min_weight: float = 0.0):
-    """Plots every located node; hovering one draws its top_n strongest outgoing edges as animated
-    dashed lines (color matches the source: blue for rainfall, red for water level), removed on
-    mouseout. All interactivity runs client-side (embedded JS), since the graph the user hovers is
-    fixed at render time - no server round-trip needed."""
-    top_edges = top_n_outgoing_per_node(graph, channel_names, coords, top_n, min_weight)
+                    min_weight: float = 0.0, direction: str = 'outgoing'):
+    """Plots every located node; hovering one draws its top_n strongest edges as animated dashed
+    lines, removed on mouseout. direction='outgoing' (default) shows what that node causes, colored
+    by the hovered node's type; direction='incoming' shows what causes that node, colored per edge
+    by the cause's type (the hovered node is always WL_*, but its causes can be either type). All
+    interactivity runs client-side (embedded JS), since the graph the user hovers is fixed at render
+    time - no server round-trip needed."""
+    if direction == 'incoming':
+        top_edges = top_n_incoming_per_node(graph, channel_names, coords, top_n, min_weight)
+    else:
+        top_edges = top_n_outgoing_per_node(graph, channel_names, coords, top_n, min_weight)
 
     marker_vars = []
     for name, (lat, lon) in coords.items():
@@ -201,6 +234,7 @@ def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coord
 
     node_coords_json = json.dumps({n: [lat, lon] for n, (lat, lon) in coords.items()})
     top_edges_json = json.dumps(top_edges)
+    direction_json = json.dumps(direction)
 
     script_lines = [f"""
 <style>
@@ -216,6 +250,7 @@ window.addEventListener('load', function() {{
     var map = {m.get_name()};
     var nodeCoords = {node_coords_json};
     var topEdges = {top_edges_json};
+    var direction = {direction_json};  // 'outgoing': node causes the edges; 'incoming': node is caused
     var activeLines = [];
 
     function clearLines() {{
@@ -223,21 +258,28 @@ window.addEventListener('load', function() {{
         activeLines = [];
     }}
 
-    function showLinks(source, color) {{
+    function showLinks(node) {{
         clearLines();
-        var edges = topEdges[source] || [];
+        var edges = topEdges[node] || [];
         if (!edges.length) return;
         var weights = edges.map(function(e) {{ return e[1]; }});
         var maxW = Math.max.apply(null, weights), minW = Math.min.apply(null, weights);
         var span = (maxW - minW) || 1;
         edges.forEach(function(e) {{
-            var target = e[0], w = e[1];
-            if (!nodeCoords[target]) return;
+            var other = e[0], w = e[1];
+            if (!nodeCoords[other]) return;
             var strength = (w - minW) / span;
-            var line = L.polyline([nodeCoords[source], nodeCoords[target]], {{
+            // outgoing: node is the cause, line runs node -> other. incoming: node is the effect,
+            // line runs other -> node. Either way the line is colored by whichever endpoint is the
+            // cause, since that's what blue-vs-red means on this map.
+            var from = direction === 'outgoing' ? node : other;
+            var to = direction === 'outgoing' ? other : node;
+            var causeNode = direction === 'outgoing' ? node : other;
+            var color = causeNode.indexOf('RH_') === 0 ? 'steelblue' : 'crimson';
+            var line = L.polyline([nodeCoords[from], nodeCoords[to]], {{
                 color: color, weight: 2 + 4 * strength, opacity: 0.55 + 0.45 * strength,
             }}).addTo(map);
-            line.bindTooltip(source + ' -> ' + target + ': ' + w.toFixed(4));
+            line.bindTooltip(from + ' -> ' + to + ': ' + w.toFixed(4));
             var el = line.getElement();
             if (el) {{ el.classList.add('hover-edge'); }}
             activeLines.push(line);
@@ -245,16 +287,14 @@ window.addEventListener('load', function() {{
     }}
 """]
     for marker_var, name in marker_vars:
-        color = 'steelblue' if name.startswith('RH_') else 'crimson'
         script_lines.append(
-            f"    {marker_var}.on('mouseover', function() {{ "
-            f"showLinks({json.dumps(name)}, {json.dumps(color)}); }});\n"
+            f"    {marker_var}.on('mouseover', function() {{ showLinks({json.dumps(name)}); }});\n"
             f"    {marker_var}.on('mouseout', clearLines);\n"
         )
     script_lines.append('});\n</script>\n')
 
     m.get_root().html.add_child(folium.Element(''.join(script_lines)))
-    print(f'Wrote hover map: {len(coords)} nodes, up to {top_n} outgoing edges shown per hover')
+    print(f'Wrote hover map: {len(coords)} nodes, up to {top_n} {direction} edges shown per hover')
 
 
 def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, top_k: int,
@@ -281,8 +321,9 @@ def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, t
         attr='Esri, HERE, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors, and the GIS User Community',
     )
 
-    if mode == 'hover':
-        build_hover_map(m, graph, channel_names, coords, top_n, min_weight)
+    if mode in ('hover', 'hover-incoming'):
+        direction = 'incoming' if mode == 'hover-incoming' else 'outgoing'
+        build_hover_map(m, graph, channel_names, coords, top_n, min_weight, direction)
         m.save(output)
         print(f'Wrote {output}')
         return
@@ -343,14 +384,16 @@ def main():
     parser.add_argument('--output', default='causal_map.html')
     parser.add_argument('--top-k', type=int, default=15,
                          help='number of strongest edges to draw (--mode top-k only)')
-    parser.add_argument('--mode', choices=['top-k', 'per-node-outgoing', 'hover'], default='top-k',
+    parser.add_argument('--mode', choices=['top-k', 'per-node-outgoing', 'hover', 'hover-incoming'],
+                         default='top-k',
                          help='top-k: globally strongest edges. per-node-outgoing: for each source '
                               'node, only its single strongest outgoing edge. hover: plot all nodes '
-                              'and show a node\'s top --top-n outgoing edges (animated) on hover.')
+                              'and show a node\'s top --top-n outgoing edges (animated) on hover. '
+                              'hover-incoming: same, but shows a node\'s top --top-n causes instead.')
     parser.add_argument('--rain-shift-m', type=float, default=10000,
                          help='meters to shift RH_* (rainfall) stations north before plotting')
     parser.add_argument('--top-n', type=int, default=5,
-                         help='number of outgoing edges to show per node on hover (--mode hover only)')
+                         help='number of edges to show per node on hover (--mode hover/hover-incoming only)')
     parser.add_argument('--min-weight', type=float, default=0.0,
                          help='drop edges weaker than this (all modes); 0 keeps every edge')
     args = parser.parse_args()

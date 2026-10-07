@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the rws_waterinfo pipeline end to end in one command: occlude implausible values -> resample ->
-# drop sparse channels -> train -> causal maps (hover and static).
+# drop sparse channels -> train -> causal maps (outgoing hover, incoming hover, and static).
 #
 # Input is the output of download_rws_waterlevel.py (rws_waterinfo/). The raw download is never modified.
 #
@@ -51,7 +51,7 @@ python3 cuts_plus_prototype/cuts_plus_rca.py \
   --save-dir "$RUN_DIR/models" \
   --log-dir "$RUN_DIR/runs"
 
-echo "=== 5/6: hover causal map (top $HOVER_TOP_N per node, edges >= $MIN_WEIGHT) ==="
+echo "=== 5/7: outgoing hover causal map (top $HOVER_TOP_N per node, edges >= $MIN_WEIGHT) ==="
 python3 cuts_plus_prototype/plot_causal_map.py \
   --graph "$RUN_DIR/models/cuts_plus_graph.npy" \
   --data-dir "$PREPARED_DIR" \
@@ -59,7 +59,15 @@ python3 cuts_plus_prototype/plot_causal_map.py \
   --output "$RUN_DIR/causal_map.html" \
   --mode hover --top-n "$HOVER_TOP_N" --min-weight "$MIN_WEIGHT"
 
-echo "=== 6/6: static causal map (strongest edges >= $MIN_WEIGHT) ==="
+echo "=== 6/7: incoming hover causal map (top $HOVER_TOP_N causes per node, edges >= $MIN_WEIGHT) ==="
+python3 cuts_plus_prototype/plot_causal_map.py \
+  --graph "$RUN_DIR/models/cuts_plus_graph.npy" \
+  --data-dir "$PREPARED_DIR" \
+  --locations-csv "$ADAPTED_DIR/locations.csv" \
+  --output "$RUN_DIR/causal_map_incoming.html" \
+  --mode hover-incoming --top-n "$HOVER_TOP_N" --min-weight "$MIN_WEIGHT"
+
+echo "=== 7/7: static causal map (strongest edges >= $MIN_WEIGHT) ==="
 python3 cuts_plus_prototype/plot_causal_map.py \
   --graph "$RUN_DIR/models/cuts_plus_graph.npy" \
   --data-dir "$PREPARED_DIR" \
@@ -67,4 +75,4 @@ python3 cuts_plus_prototype/plot_causal_map.py \
   --output "$RUN_DIR/causal_map_static.html" \
   --mode top-k --min-weight "$MIN_WEIGHT"
 
-echo "Done. Maps at $RUN_DIR/causal_map.html (hover) and $RUN_DIR/causal_map_static.html (static)"
+echo "Done. Maps at $RUN_DIR/causal_map.html (outgoing hover), $RUN_DIR/causal_map_incoming.html (incoming hover), and $RUN_DIR/causal_map_static.html (static)"
