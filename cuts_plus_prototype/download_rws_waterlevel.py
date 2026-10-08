@@ -1,10 +1,12 @@
 """
-Downloads Rijkswaterstaat measured water levels (grootheid WATHTE) with the rws-waterinfo package and
-rebuilds them into two-week session files in the same layout as rws_data (one parquet per session,
-timestamp index, one column per location code), so the existing adapt/prepare/train pipeline can read them.
+Downloads a single Rijkswaterstaat quantity (grootheid) with the rws-waterinfo package and rebuilds it
+into two-week session files in the same layout as rws_data (one parquet per session, timestamp index,
+one column per location code), so the existing adapt/prepare/train pipeline can read it. Water level
+(WATHTE, cm) is the default; discharge (Q, m3/s) uses the same script with --grootheid/--eenheid.
 
-Why WATHTE only: the earlier rws_data export mixed many quantities (concentrations, counts, temperature,
-wind, discharge) under the same location names. Selecting the quantity explicitly avoids that.
+Why one quantity at a time: the earlier rws_data export mixed many quantities (concentrations, counts,
+temperature, wind, discharge) under the same location names with no way to tell them apart. Selecting
+the quantity explicitly avoids that - run this script once per quantity, into separate --out directories.
 
 Two passes, each resumable:
   1. download: one wide yearly table per year (raw/YYYY.parquet), requests batched through get_data().
@@ -17,6 +19,9 @@ Install first:  pip install rws-waterinfo
 Usage:
     python3 cuts_plus_prototype/download_rws_waterlevel.py --out rws_waterinfo \
         --start 2005-01-01 --end 2025-01-01 --workers 10
+    # discharge, same date range:
+    python3 cuts_plus_prototype/download_rws_waterlevel.py --out rws_discharge \
+        --grootheid Q --eenheid m3/s --start 2005-01-01 --end 2025-01-01 --workers 10
     # quick test on a few stations and one month:
     python3 cuts_plus_prototype/download_rws_waterlevel.py --out rws_test \
         --start 2024-01-01 --end 2024-02-01 --limit-codes 3
@@ -32,10 +37,10 @@ import rws_waterinfo as rw
 SESSION_DAYS = 14
 
 
-def select_locations(catalog: pd.DataFrame, compartiment: str, eenheid: str, proces: str,
+def select_locations(catalog: pd.DataFrame, grootheid: str, compartiment: str, eenheid: str, proces: str,
                      limit: int | None) -> pd.DataFrame:
-    """One row per (location, measuring device) that measures water level in the requested unit."""
-    sel = catalog[(catalog['Grootheid.Code'] == 'WATHTE') & (catalog['ProcesType'] == proces)
+    """One row per (location, measuring device) that measures the given quantity in the requested unit."""
+    sel = catalog[(catalog['Grootheid.Code'] == grootheid) & (catalog['ProcesType'] == proces)
                   & (catalog['Eenheid.Code'] == eenheid) & (catalog['Compartiment.Code'] == compartiment)]
     sel = sel.drop_duplicates(['Code', 'MeetApparaat.Code']).sort_values(['Code', 'MeetApparaat.Code'])
     if limit:
@@ -43,23 +48,23 @@ def select_locations(catalog: pd.DataFrame, compartiment: str, eenheid: str, pro
     return sel.reset_index(drop=True)
 
 
-def request_params(sel: pd.DataFrame, start: str, end: str, proces: str) -> list:
+def request_params(sel: pd.DataFrame, start: str, end: str, proces: str, grootheid: str) -> list:
     return [{
         'locatie_code': r['Code'],
         'compartiment_code': r['Compartiment.Code'],
         'eenheid_code': r['Eenheid.Code'],
         'meetapparaat_code': int(r['MeetApparaat.Code']),  # numpy int64 is not JSON-serializable
-        'grootheid_code': 'WATHTE',
+        'grootheid_code': grootheid,
         'start_date': start,
         'end_date': end,
         'proces_type': proces,
     } for _, r in sel.iterrows()]
 
 
-def download_year(sel: pd.DataFrame, year: int, proces: str, workers: int, batch: int) -> pd.DataFrame:
+def download_year(sel: pd.DataFrame, year: int, proces: str, workers: int, batch: int, grootheid: str) -> pd.DataFrame:
     """Wide table for one year: index = local naive timestamp, one column per location code."""
     start, end = f'{year}-01-01', f'{year + 1}-01-01'
-    params = request_params(sel, start, end, proces)
+    params = request_params(sel, start, end, proces, grootheid)
     pieces, seen = [], set()
     for i in range(0, len(params), batch):
         chunk = params[i:i + batch]
@@ -119,8 +124,9 @@ def main():
     p.add_argument('--out', default='rws_waterinfo')
     p.add_argument('--start', default='2005-01-01')
     p.add_argument('--end', default='2025-01-01')
+    p.add_argument('--grootheid', default='WATHTE', help="quantity code, e.g. 'WATHTE' (water level) or 'Q' (discharge)")
     p.add_argument('--compartiment', default='OW', help='surface water = OW')
-    p.add_argument('--eenheid', default='cm')
+    p.add_argument('--eenheid', default='cm', help="unit code matching --grootheid, e.g. 'cm' or 'm3/s'")
     p.add_argument('--proces', default='meting', help='measured values (not forecasts/astronomical)')
     p.add_argument('--workers', type=int, default=10)
     p.add_argument('--batch', type=int, default=100, help='requests per get_data call')
@@ -138,7 +144,7 @@ def main():
         catalog = rw.get_catalog()
         if args.catalog:
             catalog.to_csv(args.catalog, index=False)
-    sel = select_locations(catalog, args.compartiment, args.eenheid, args.proces, args.limit_codes)
+    sel = select_locations(catalog, args.grootheid, args.compartiment, args.eenheid, args.proces, args.limit_codes)
     print(f'{sel["Code"].nunique()} locations, {len(sel)} location/device requests per year')
 
     print('=== pass 1: download by year ===')
@@ -148,7 +154,7 @@ def main():
         if os.path.exists(path):
             print(f'  {year}: already downloaded, skipping')
             continue
-        wide = download_year(sel, year, args.proces, args.workers, args.batch)
+        wide = download_year(sel, year, args.proces, args.workers, args.batch, args.grootheid)
         if len(wide):
             wide.to_parquet(path)
             print(f'  {year}: saved {wide.shape[0]} timestamps x {wide.shape[1]} locations')

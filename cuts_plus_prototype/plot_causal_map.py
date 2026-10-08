@@ -2,9 +2,11 @@
 Plots the discovered causal graph on a folium map using real station coordinates from
 locations.csv (EPSG:28992, Dutch RD). Nodes = channels with known coordinates; arrows = causal
 edges (effect <- cause), thicker/darker for stronger edges, colored by source type (blue for
-rainfall, red for water level). Rainfall (RH_*) stations are shifted northward so they visually sit
-"above" the water-level network, since their real location isn't otherwise distinguishable on the
-map from a water-level sensor.
+rainfall, green for discharge, red for water level), all at their real coordinates. Discharge
+(Q_*) stations are shifted eastward by a small amount - a discharge gauge is very often at
+essentially the same point as the water-level gauge of the same code, so without a shift the two
+markers would land exactly on top of each other. Rainfall needs no such shift (--rain-shift-m
+defaults to 0): a KNMI weather station isn't normally co-located with a water-level gauge.
 
 --mode hover plots only nodes up front; hovering one animates its top --top-n strongest outgoing
 edges in instead of drawing every edge at once, which is far more legible once the node count gets
@@ -32,6 +34,17 @@ from folium.plugins import PolyLineTextPath
 from pyproj import Transformer
 
 
+def node_color(name: str, kind: str = 'marker') -> str:
+    """Color convention used everywhere on this map: blue for rainfall, green for discharge, red
+    (the water-level default, since that's everything else) otherwise. kind='marker' uses a darker
+    red than kind='line'/'js', matching this script's existing marker-vs-line distinction."""
+    if name.startswith('RH_'):
+        return 'steelblue'
+    if name.startswith('Q_'):
+        return 'seagreen'
+    return 'darkred' if kind == 'marker' else 'crimson'
+
+
 def load_channel_names(data_dir: str, graph_path: str) -> list:
     """Prefers the channel_names.json cuts_plus_rca.py saves next to the graph - the training
     pipeline can drop zero-observation channels, so the graph's row/column order doesn't always
@@ -45,17 +58,30 @@ def load_channel_names(data_dir: str, graph_path: str) -> list:
     return list(pd.read_parquet(f).columns)
 
 
-def load_locations(locations_csv: str, channel_names: list, rain_shift_m: float) -> dict:
-    """Maps channel name -> (lat, lon), shifting RH_* stations `rain_shift_m` meters north before
-    converting to lat/lon. locations.csv drops the "WL_" prefix that water-level channels have in
-    the data; RH_* names match directly.
+def load_locations(locations_csv: str, channel_names: list, rain_shift_m: float,
+                   discharge_shift_m: float = 3000.0) -> dict:
+    """Maps channel name -> (lat, lon), shifting RH_* stations `rain_shift_m` meters north (0 by
+    default - see below) and Q_* stations `discharge_shift_m` meters east before converting to
+    lat/lon. locations.csv drops the
+    "WL_"/"Q_" prefix that water-level and discharge channels have in the data (both are written by
+    download_rws_waterlevel.py, which stores the bare station code); RH_* names match directly,
+    since knmi_rain/locations.csv already stores the full prefixed channel name.
+
+    The discharge shift exists because a discharge gauge is very often at (or essentially at) the
+    same point as the water-level gauge of the same code - confirmed on real data, e.g. 'almen' gives
+    identical coordinates for WL_almen and Q_almen. Without a shift the two markers would sit exactly
+    on top of each other, and the default distance is just enough to separate two markers at the
+    zoom level this map renders at, not a real location. rain_shift_m exists for the same mechanism
+    but defaults to 0, since rain stations don't have this collision problem - pass it explicitly
+    if you want rain pulled apart from the network for some other reason.
 
     Supports two locations.csv schemas, detected by column names:
       - name/x/y (EPSG:28992, e.g. two_week_chunks_*) - projected to lat/lon via pyproj, and the
         shift is a true distance since it's applied in the projected CRS before conversion.
       - name/lat/lon (already lat/lon, e.g. rws_data_adapted) - used directly; the shift is applied
-        as an approximate degrees-latitude offset (111,320 m/degree), since there's no projected CRS
-        to shift a true distance in here.
+        as an approximate degrees offset (111,320 m/degree), since there's no projected CRS to shift
+        a true distance in here. For the eastward (longitude) shift this ignores the cos(latitude)
+        compression, same simplification the existing northward shift already makes for latitude.
     """
     locs = pd.read_csv(locations_csv).set_index('name')
     is_projected = 'x' in locs.columns and 'y' in locs.columns
@@ -64,18 +90,25 @@ def load_locations(locations_csv: str, channel_names: list, rain_shift_m: float)
 
     coords = {}
     for c in channel_names:
-        stripped = c[len('WL_'):] if c.startswith('WL_') else c
+        if c.startswith('WL_') or c.startswith('Q_'):
+            stripped = c.split('_', 1)[1]
+        else:
+            stripped = c
         if stripped not in locs.index:
             continue
         if is_projected:
             x, y = float(locs.loc[stripped, 'x']), float(locs.loc[stripped, 'y'])
             if c.startswith('RH_'):
                 y = y + rain_shift_m
+            elif c.startswith('Q_'):
+                x = x + discharge_shift_m
             lon, lat = transformer.transform(x, y)
         else:
             lat, lon = float(locs.loc[stripped, 'lat']), float(locs.loc[stripped, 'lon'])
             if c.startswith('RH_'):
                 lat = lat + rain_shift_m / 111320
+            elif c.startswith('Q_'):
+                lon = lon + discharge_shift_m / 111320
         coords[c] = (float(lat), float(lon))  # plain floats: folium/branca JSON-serializes these
     return coords
 
@@ -206,8 +239,7 @@ def build_hover_map(m: folium.Map, graph: np.ndarray, channel_names: list, coord
 
     marker_vars = []
     for name, (lat, lon) in coords.items():
-        is_rain = name.startswith('RH_')
-        color = 'steelblue' if is_rain else 'darkred'
+        color = node_color(name)
         folium.CircleMarker(
             location=[lat, lon],
             radius=8,
@@ -275,7 +307,8 @@ window.addEventListener('load', function() {{
             var from = direction === 'outgoing' ? node : other;
             var to = direction === 'outgoing' ? other : node;
             var causeNode = direction === 'outgoing' ? node : other;
-            var color = causeNode.indexOf('RH_') === 0 ? 'steelblue' : 'crimson';
+            var color = causeNode.indexOf('RH_') === 0 ? 'steelblue'
+                      : causeNode.indexOf('Q_') === 0 ? 'seagreen' : 'crimson';
             var line = L.polyline([nodeCoords[from], nodeCoords[to]], {{
                 color: color, weight: 2 + 4 * strength, opacity: 0.55 + 0.45 * strength,
             }}).addTo(map);
@@ -298,14 +331,15 @@ window.addEventListener('load', function() {{
 
 
 def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, top_k: int,
-              rain_shift_m: float, mode: str = 'top-k', top_n: int = 5, min_weight: float = 0.0):
+              rain_shift_m: float, mode: str = 'top-k', top_n: int = 5, min_weight: float = 0.0,
+              discharge_shift_m: float = 3000.0):
     graph = np.load(graph_path)
     channel_names = load_channel_names(data_dir, graph_path)
     if graph.shape != (len(channel_names), len(channel_names)):
         raise ValueError(f'graph shape {graph.shape} does not match {len(channel_names)} channels '
                           f'found in {data_dir} - is --data-dir the dataset this graph was trained on?')
 
-    coords = load_locations(locations_csv, channel_names, rain_shift_m)
+    coords = load_locations(locations_csv, channel_names, rain_shift_m, discharge_shift_m)
     missing = [c for c in channel_names if c not in coords]
     if missing:
         print(f'{len(missing)} channel(s) skipped (no location in {locations_csv}): {missing}')
@@ -336,17 +370,16 @@ def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, t
         # a threshold above every edge weight leaves nothing to draw: keep the map with its nodes
         print(f'WARNING: no edges with weight >= {min_weight}; the map shows nodes only')
         for name, (lat, lon) in coords.items():
-            folium.CircleMarker(location=[lat, lon], radius=4, tooltip=name).add_to(m)
+            folium.CircleMarker(location=[lat, lon], radius=4, color=node_color(name), tooltip=name).add_to(m)
         m.save(output)
         print(f'Wrote {output}: {len(coords)} nodes, 0 edges plotted')
         return
 
     for name, (lat, lon) in coords.items():
-        is_rain = name.startswith('RH_')
         folium.CircleMarker(
             location=[lat, lon],
             radius=8,
-            color='steelblue' if is_rain else 'darkred',
+            color=node_color(name),
             fill=True,
             fill_opacity=0.9,
             popup=name,
@@ -359,7 +392,7 @@ def build_map(graph_path: str, data_dir: str, locations_csv: str, output: str, t
     for w, effect, cause in edges:
         strength = float((w - min_w) / span)  # 0..1, relative to the plotted edges only - plain
         # float: folium/branca JSON-serializes these and chokes on numpy scalar types (e.g. float32).
-        color = 'steelblue' if cause.startswith('RH_') else 'crimson'
+        color = node_color(cause, kind='line')
         line = folium.PolyLine(
             locations=[coords[cause], coords[effect]],
             color=color,
@@ -390,15 +423,19 @@ def main():
                               'node, only its single strongest outgoing edge. hover: plot all nodes '
                               'and show a node\'s top --top-n outgoing edges (animated) on hover. '
                               'hover-incoming: same, but shows a node\'s top --top-n causes instead.')
-    parser.add_argument('--rain-shift-m', type=float, default=10000,
-                         help='meters to shift RH_* (rainfall) stations north before plotting')
+    parser.add_argument('--rain-shift-m', type=float, default=0,
+                         help='meters to shift RH_* (rainfall) stations north before plotting; '
+                              '0 (default) plots them at their real coordinates')
+    parser.add_argument('--discharge-shift-m', type=float, default=3000,
+                         help='meters to shift Q_* (discharge) stations east before plotting - '
+                              'keeps them from landing exactly on a same-code water-level station')
     parser.add_argument('--top-n', type=int, default=5,
                          help='number of edges to show per node on hover (--mode hover/hover-incoming only)')
     parser.add_argument('--min-weight', type=float, default=0.0,
                          help='drop edges weaker than this (all modes); 0 keeps every edge')
     args = parser.parse_args()
     build_map(args.graph, args.data_dir, args.locations_csv, args.output, args.top_k,
-              args.rain_shift_m, args.mode, args.top_n, args.min_weight)
+              args.rain_shift_m, args.mode, args.top_n, args.min_weight, args.discharge_shift_m)
 
 
 if __name__ == '__main__':

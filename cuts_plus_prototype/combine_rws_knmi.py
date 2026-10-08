@@ -1,17 +1,22 @@
 """
 Combines the occluded rws water levels (rws_waterinfo_adapted/, WL_* columns, 5- or 10-minute) with the
-KNMI hourly rainfall (knmi_rain/sessions/, RH_* columns) into one set of two-week sessions.
+KNMI hourly rainfall (knmi_rain/sessions/, RH_* columns) and, optionally, the occluded rws discharge
+(rws_discharge_adapted/, Q_* columns, same cadence as water level) into one set of two-week sessions.
 
 Rainfall is hourly, so each hour's total is spread evenly over the six 10-minute steps that make it up
 (value / 6 at each step). This keeps every hourly total exact, but it assumes the rain fell evenly within
-the hour; no sub-hourly rain pattern is invented. Hours missing in the KNMI data stay NaN.
+the hour; no sub-hourly rain pattern is invented. Hours missing in the KNMI data stay NaN. Discharge needs
+no such spreading: it's downloaded the same way as water level (download_rws_waterlevel.py), so it already
+shares water level's native cadence and session grid - it's just concatenated in like another column group.
 
-Sessions are paired by their date range, so both inputs must use the same session boundaries (they do
-for rws_waterinfo and knmi_rain). A session with no rainfall file keeps its water levels with NaN rain.
+Sessions are paired by their date range, so every input must use the same session boundaries (they do
+for rws_waterinfo, rws_discharge and knmi_rain, all starting 2005-01-01 on a 14-day grid). A session
+missing from one source keeps the others, with NaN for the missing one.
 
 Usage:
     python3 cuts_plus_prototype/combine_rws_knmi.py --wl-dir rws_waterinfo_adapted --rain-dir knmi_rain/sessions \
         --rain-locations knmi_rain/locations.csv --wl-locations rws_waterinfo_adapted/locations.csv \
+        --discharge-dir rws_discharge_adapted --discharge-locations rws_discharge_adapted/locations.csv \
         --output combined_adapted
 """
 import argparse
@@ -39,9 +44,12 @@ def hourly_to_10min(hourly: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp
     return pd.DataFrame(values, index=grid, columns=hourly.columns)
 
 
-def combine(wl_dir: str, rain_dir: str, output_dir: str, wl_locations: str, rain_locations: str):
+def combine(wl_dir: str, rain_dir: str, output_dir: str, wl_locations: str, rain_locations: str,
+           discharge_dir: str = None, discharge_locations: str = None):
     os.makedirs(output_dir, exist_ok=True)
     rain_by_range = {session_key(f): f for f in glob.glob(os.path.join(rain_dir, '*.parquet'))}
+    discharge_by_range = ({session_key(f): f for f in glob.glob(os.path.join(discharge_dir, '*.parquet'))}
+                          if discharge_dir else {})
     wl_files = sorted(glob.glob(os.path.join(wl_dir, '*.parquet')))
     if not wl_files:
         raise ValueError(f'No water-level sessions in {wl_dir}')
@@ -49,27 +57,37 @@ def combine(wl_dir: str, rain_dir: str, output_dir: str, wl_locations: str, rain
     if rain_by_range and not any(session_key(f) in rain_by_range for f in wl_files):
         raise ValueError('no rainfall session has the same date range as a water-level session; '
                          'both datasets must be cut on the same 14-day grid (start 2005-01-01)')
+    if discharge_by_range and not any(session_key(f) in discharge_by_range for f in wl_files):
+        raise ValueError('no discharge session has the same date range as a water-level session; '
+                         'both datasets must be cut on the same 14-day grid (start 2005-01-01)')
+
     n_with_rain = 0
+    n_with_discharge = 0
     for f in wl_files:
         key = session_key(f)
         start = pd.Timestamp(key[0])
         end = pd.Timestamp(key[1])  # sessions are contiguous: this is also the next session's start
-        wl = pd.read_parquet(f)
+        parts = [pd.read_parquet(f)]
 
         if key in rain_by_range:
             hourly = pd.read_parquet(rain_by_range[key])
-            rain = hourly_to_10min(hourly, start, end)
+            parts.append(hourly_to_10min(hourly, start, end))
             n_with_rain += 1
-            combined = pd.concat([wl, rain], axis=1).sort_index()
-        else:
-            combined = wl.sort_index()
+        if key in discharge_by_range:
+            parts.append(pd.read_parquet(discharge_by_range[key]))  # already on the same grid as wl
+            n_with_discharge += 1
+
+        combined = pd.concat(parts, axis=1).sort_index() if len(parts) > 1 else parts[0].sort_index()
         combined.index.name = 'timestamp'
         combined.to_parquet(os.path.join(output_dir, os.path.basename(f)))
 
-    loc = pd.concat([pd.read_csv(wl_locations), pd.read_csv(rain_locations)], ignore_index=True)
+    loc_parts = [pd.read_csv(wl_locations), pd.read_csv(rain_locations)]
+    if discharge_locations:
+        loc_parts.append(pd.read_csv(discharge_locations))
+    loc = pd.concat(loc_parts, ignore_index=True)
     loc.drop_duplicates('name').to_csv(os.path.join(output_dir, 'locations.csv'), index=False)
     print(f'{len(wl_files)} session(s) written; {n_with_rain} with rainfall, '
-          f'{len(wl_files) - n_with_rain} without')
+          f'{n_with_discharge} with discharge')
 
 
 def main():
@@ -78,9 +96,12 @@ def main():
     p.add_argument('--rain-dir', default='knmi_rain/sessions')
     p.add_argument('--wl-locations', default='rws_waterinfo_adapted/locations.csv')
     p.add_argument('--rain-locations', default='knmi_rain/locations.csv')
+    p.add_argument('--discharge-dir', default=None, help='optional: occluded discharge, e.g. rws_discharge_adapted')
+    p.add_argument('--discharge-locations', default=None)
     p.add_argument('--output', default='combined_adapted')
     args = p.parse_args()
-    combine(args.wl_dir, args.rain_dir, args.output, args.wl_locations, args.rain_locations)
+    combine(args.wl_dir, args.rain_dir, args.output, args.wl_locations, args.rain_locations,
+            args.discharge_dir, args.discharge_locations)
 
 
 if __name__ == '__main__':
