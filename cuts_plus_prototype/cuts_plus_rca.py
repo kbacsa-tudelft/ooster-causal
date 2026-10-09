@@ -130,6 +130,22 @@ class CUTSPlusRCAConfig:
     flood_events_csv: str = ''
     flood_min_alert: str = 'medium'
 
+    # CUTS+'s own iterative imputation (vendor/cuts_plus.py's MultiCAD.train): every epoch it predicts
+    # a value for every masked/missing position from its own learned dynamics (data_pred). Whether
+    # that prediction ever replaces the static mean-fill used as the working data is controlled here -
+    # 'none' (default) never updates it, so missing positions stay at the training mean for the whole
+    # run (this pipeline's behavior before this option existed). Two policies turn the update on:
+    #   'rate_X_after_Y'  after epoch Y, each epoch blends working data toward data_pred at rate X
+    #                     (e.g. 'rate_0.1_after_5') - the observation mask is untouched, so these
+    #                     positions still never contribute to the training loss as targets, only as
+    #                     context for predicting other (real) timesteps.
+    #   'every_N'         every N epochs, working data is replaced outright by data_pred AND the
+    #                     observation mask is set to all-observed from then on - so previously-missing
+    #                     positions start counting as real targets in the loss, trusting the model's
+    #                     own predictions as ground truth. Stronger, more self-reinforcing; prefer
+    #                     'rate_X_after_Y' unless this is specifically what's wanted.
+    fill_policy: str = 'none'
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Train CUTS+ + root-cause-analysis on synthetic data.')
@@ -244,7 +260,7 @@ def build_opt(config: CUTSPlusRCAConfig, n_nodes: int):
         'n_groups': min(config.n_groups, n_nodes),
         'group_policy': config.group_policy,
         'supervision_policy': 'full',
-        'fill_policy': 'none',
+        'fill_policy': config.fill_policy,
         'show_graph_every': config.show_graph_every,
         'data_pred': {
             'pred_step': 1,
