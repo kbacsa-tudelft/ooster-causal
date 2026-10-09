@@ -1,5 +1,5 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Eight deliberate deviations from upstream, kept as the only edits so this stays
+# see ../LICENSE). Nine deliberate deviations from upstream, kept as the only edits so this stays
 # otherwise faithful to the source:
 #   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
 #      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
@@ -62,6 +62,14 @@
 #      checkpoint is (or isn't) loaded - harmless in the normal case, since the loop's own per-epoch
 #      computation is identical and immediately overwrites it; only the zero-iterations case actually
 #      relies on this value.
+#   9. MultiCAD.train() gained an optional `allowed_mask` parameter (default None, so any existing
+#      caller is unaffected): an (n_nodes, n_nodes) {0,1} matrix, row=cause/col=effect, multiplied into
+#      every Graph tensor right after it's built (s1_graph, graph_discov's Graph, and the end-of-epoch
+#      plotting/return Graph) and before loss_sparsity/sampling - so a forbidden (cause, effect) pair
+#      gets zero probability, zero gradient, and can never be learned, instead of just being penalized
+#      like any other edge. Added so a caller with known-exogenous variables (e.g. rainfall, which
+#      nothing in a water-level/discharge dataset can physically cause) can rule out that whole
+#      direction instead of leaving it to be discovered from correlation alone.
 
 import logging
 import os, sys
@@ -278,6 +286,8 @@ class MultiCAD(object):
         G_prob = self.G
 
         Graph = torch.einsum("nm,ml->nl", G_prob, torch.sigmoid(GT_prob))
+        if self.allowed_mask is not None:
+            Graph = Graph * self.allowed_mask
         graph_sampled = gumbel_sigmoid_sample(Graph, self.args.batch_size)
 
         loss_sparsity = torch.linalg.norm(Graph.flatten(), ord=1) / (n * n)
@@ -294,17 +304,20 @@ class MultiCAD(object):
 
 
     def train(self, data, observ_mask, original_data, true_cm=None, epoch_callback=None,
-              checkpoint_path=None, checkpoint_every=1):
+              checkpoint_path=None, checkpoint_every=1, allowed_mask=None):
         # perf patch note above covers deviations 1-2; this optional epoch_callback param is a third,
         # purely additive one: defaults to None (no-op, unchanged behavior for any existing caller),
         # invoked as epoch_callback(epoch_i, Graph) once per epoch with the raw (untransposed,
         # source->target) graph, so a caller can e.g. plot it periodically without modifying this loop.
         # checkpoint_path/checkpoint_every are a sixth, also purely additive deviation - both default
         # to a no-op for any existing caller. See deviation 6 in the header comment.
+        # allowed_mask is a ninth, also purely additive deviation (default None) - see deviation 9.
 
         original_data = torch.from_numpy(original_data).float().to(self.device)
         observ_mask = torch.from_numpy(observ_mask).float().to(self.device)
         data = torch.from_numpy(data).float().to(self.device)
+        self.allowed_mask = (torch.from_numpy(allowed_mask).float().to(self.device)
+                              if allowed_mask is not None else None)
 
         if self.args.supervision_policy == "masked":
             print("Using masked supervision for data prediction...")
@@ -349,6 +362,8 @@ class MultiCAD(object):
             G_prob = self.G.detach().cpu().numpy()
             GT_prob = torch.sigmoid(self.GT).detach().cpu().numpy()
             Graph = np.einsum("nm,ml->nl", G_prob, GT_prob)
+            if self.allowed_mask is not None:
+                Graph = Graph * self.allowed_mask.cpu().numpy()
         pbar = tqdm.tqdm(total=self.args.total_epoch, initial=start_epoch)
         data_interp = deepcopy(data)
         original_mask = deepcopy(observ_mask)
@@ -448,6 +463,8 @@ class MultiCAD(object):
                 # Detached: this path never backpropped into self.GT/self.G anyway (torch.bernoulli has
                 # no gradient w.r.t. its input), so this changes nothing about what gets learned.
                 s1_graph = torch.einsum("nm,ml->nl", self.G, torch.sigmoid(self.GT)).detach()
+                if self.allowed_mask is not None:
+                    s1_graph = s1_graph * self.allowed_mask
 
                 # perf patch (deviation 7): data_pred_all is only ever read by log_time_series below,
                 # itself gated by show_graph_every - building the full-dataset clone and scatter-
@@ -514,6 +531,8 @@ class MultiCAD(object):
             G_prob = self.G.detach().cpu().numpy()
             GT_prob = torch.sigmoid(self.GT).detach().cpu().numpy()  # see deviation 4 in header comment
             Graph = np.einsum("nm,ml->nl", G_prob, GT_prob)
+            if self.allowed_mask is not None:
+                Graph = Graph * self.allowed_mask.cpu().numpy()
 
             if epoch_callback is not None:
                 epoch_callback(epoch_i, Graph)

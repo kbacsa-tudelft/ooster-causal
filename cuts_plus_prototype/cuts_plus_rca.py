@@ -226,6 +226,18 @@ def compute_sparse_mask(mask_for_sparsity: np.ndarray, min_channel_availability:
     return mask_for_sparsity.sum(axis=0) < min_count, min_count
 
 
+def build_rain_exogeneity_mask(channel_names: list) -> np.ndarray:
+    """(n_nodes, n_nodes) {0,1} matrix for MultiCAD.train()'s allowed_mask: forbids any non-rain
+    channel ('RH_' prefix) from being discovered as a cause of a rain channel, since nothing in a
+    water-level/discharge dataset can physically cause rainfall. Rain-to-rain and rain-to-WL/Q edges
+    are left free to be discovered. Row = cause, column = effect, matching MultiCAD's internal Graph
+    convention (see run_real_data_pipeline's `graph = graph.T` comment)."""
+    is_rain = np.array([c.startswith('RH_') for c in channel_names])
+    mask = np.ones((len(channel_names), len(channel_names)), dtype=np.float32)
+    mask[~is_rain[:, None] & is_rain[None, :]] = 0.0
+    return mask
+
+
 def concat_sessions(series_dict: dict, session_ids: list, boundary_gap: int):
     """Concatenates session DataFrames (in session_ids order) into one (T, N) array + an observ_mask
     that is 0 wherever the source data was NaN (real missing readings) and additionally 0 for the
@@ -713,6 +725,7 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
 
     multicad = MultiCAD(opt, log, device=device)
     train_norm = normalize(train_data)
+    allowed_mask = build_rain_exogeneity_mask(channel_names)
     # true_cm=None (no ground truth) - so, unlike run_pipeline, the graph MultiCAD.train() returns is
     # NOT auto-transposed into "row=effect, col=cause" convention. Transpose it ourselves below.
     # checkpoint_path lives in save_dir, so rerunning the exact same command (same --save-dir) after an
@@ -720,7 +733,8 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     # start) if this is the first run.
     graph = multicad.train(train_norm[:, :, None], train_mask[:, :, None], train_norm[:, :, None],
                             true_cm=None, epoch_callback=plot_epoch_graph,
-                            checkpoint_path=checkpoint_path, checkpoint_every=config.checkpoint_every)
+                            checkpoint_path=checkpoint_path, checkpoint_every=config.checkpoint_every,
+                            allowed_mask=allowed_mask)
     graph = graph.T
 
     log.log_figures(plot_labeled_adjacency(graph, channel_names), name='causal_graph',
