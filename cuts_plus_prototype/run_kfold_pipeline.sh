@@ -22,7 +22,6 @@
 #   predict_chunk_size        default 32
 #   locations_csv              default rws_data_adapted/locations.csv
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
 DATA_DIR="${1:-rws_data_prepared_10min}"
 N_FOLDS="${2:-5}"

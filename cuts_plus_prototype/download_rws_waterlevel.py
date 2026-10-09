@@ -16,12 +16,23 @@ A channels.csv (provenance: code, name, quantity, unit, compartment, measuring d
 
 Install first:  pip install rws-waterinfo
 
+Historical coverage varies by station and is picked up automatically: a location's catalog entry
+often lists several measuring-device codes from different eras (e.g. Vlissingen has four, the oldest
+giving 3-hourly readings back to at least 1950, the newest giving fine-grained readings from the
+1990s on), and the per-year download already tries every device for a code until one has data, with
+no extra configuration needed. Coverage and cadence both improve in later decades as more automatic
+stations came online - don't expect the 1950s-60s to look like 2020 in station count or resolution.
+
+Known limitation: if a station's measuring device changes mid-year, only the first device (by catalog
+order) that returns any data for that year is used for the whole year - a real mid-year splice between
+two devices isn't reconstructed. This predates this rewrite and wasn't in scope to fix here.
+
 Usage:
     python3 cuts_plus_prototype/download_rws_waterlevel.py --out rws_waterinfo \
-        --start 2005-01-01 --end 2025-01-01 --workers 10
+        --start 1950-01-01 --end 2025-01-01 --workers 10
     # discharge, same date range:
     python3 cuts_plus_prototype/download_rws_waterlevel.py --out rws_discharge \
-        --grootheid Q --eenheid m3/s --start 2005-01-01 --end 2025-01-01 --workers 10
+        --grootheid Q --eenheid m3/s --start 1950-01-01 --end 2025-01-01 --workers 10
     # quick test on a few stations and one month:
     python3 cuts_plus_prototype/download_rws_waterlevel.py --out rws_test \
         --start 2024-01-01 --end 2024-02-01 --limit-codes 3
@@ -122,7 +133,7 @@ def build_sessions(raw_dir: str, out_dir: str, start: str, end: str):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--out', default='rws_waterinfo')
-    p.add_argument('--start', default='2005-01-01')
+    p.add_argument('--start', default='1950-01-01')
     p.add_argument('--end', default='2025-01-01')
     p.add_argument('--grootheid', default='WATHTE', help="quantity code, e.g. 'WATHTE' (water level) or 'Q' (discharge)")
     p.add_argument('--compartiment', default='OW', help='surface water = OW')

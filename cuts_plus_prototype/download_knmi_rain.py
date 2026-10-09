@@ -13,9 +13,15 @@ Station names and coordinates come from the metadata file bundled with hydropand
 kept. Writes locations.csv (name, lat, lon) with the same column names as the rws locations file, so
 plot_causal_map.py can place the rain nodes.
 
+Historical coverage: the live API confirms hourly precipitation starts in 1951 (1950 itself returns
+nothing) with a single station (De Bilt), growing to double digits by the 1970s and the 30-40 range
+by the 2000s - don't expect early decades to have the same station density as recent ones. A station
+code the API returns for an old period but that hydropandas' current metadata snapshot no longer lists
+(e.g. retired or renamed since) is skipped with a warning rather than failing the run.
+
 Usage:
     pip install hydropandas pandas pyarrow
-    python3 cuts_plus_prototype/download_knmi_rain.py --out knmi_rain --start 2005-01-01 --end 2025-01-01
+    python3 cuts_plus_prototype/download_knmi_rain.py --out knmi_rain --start 1950-01-01 --end 2025-01-01
 """
 import argparse
 import json
@@ -60,7 +66,9 @@ def fetch_year(year: int) -> pd.DataFrame:
 
 
 def station_table(codes) -> pd.DataFrame:
-    """Name and coordinates for the station codes, from the hydropandas metadata file."""
+    """Name and coordinates for the station codes, from the hydropandas metadata file. A code the API
+    returned but that isn't in this (current) metadata snapshot - plausible for an old, since-retired
+    or renamed station over a long historical range - is skipped with a warning, not a hard failure."""
     import hydropandas
     meta_path = os.path.join(os.path.dirname(hydropandas.__file__), 'data', 'knmi_meteostation.json')
     with open(meta_path) as fh:
@@ -69,7 +77,8 @@ def station_table(codes) -> pd.DataFrame:
     for code in codes:
         k = str(code)
         if k not in meta['lat']:
-            raise ValueError(f'station {code} has no coordinates in the hydropandas metadata')
+            print(f'  warning: station {code} has no coordinates in the hydropandas metadata - skipping it')
+            continue
         rows.append({'code': int(code), 'name': meta['name'][k], 'lat': meta['lat'][k], 'lon': meta['lon'][k]})
     return pd.DataFrame(rows)
 
@@ -92,6 +101,7 @@ def build_sessions(raw_dir: str, out_dir: str, start: str, end: str, rename: dic
     local.index = local.index.tz_localize('UTC').tz_convert('Europe/Amsterdam').tz_localize(None)
     local = local[~local.index.duplicated(keep='first')]
     local.index.name = 'timestamp'
+    local = local[[c for c in local.columns if c in rename]]  # drop codes station_table() skipped
     local = local.rename(columns=rename)
 
     s = pd.Timestamp(start)
@@ -112,7 +122,7 @@ def build_sessions(raw_dir: str, out_dir: str, start: str, end: str, rename: dic
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--out', default='knmi_rain')
-    p.add_argument('--start', default='2005-01-01')
+    p.add_argument('--start', default='1950-01-01')
     p.add_argument('--end', default='2025-01-01')
     args = p.parse_args()
 

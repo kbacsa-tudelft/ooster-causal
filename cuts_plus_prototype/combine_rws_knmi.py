@@ -10,7 +10,7 @@ no such spreading: it's downloaded the same way as water level (download_rws_wat
 shares water level's native cadence and session grid - it's just concatenated in like another column group.
 
 Sessions are paired by their date range, so every input must use the same session boundaries (they do
-for rws_waterinfo, rws_discharge and knmi_rain, all starting 2005-01-01 on a 14-day grid). A session
+for rws_waterinfo, rws_discharge and knmi_rain, all starting on the same 14-day grid). A session
 missing from one source keeps the others, with NaN for the missing one.
 
 Usage:
@@ -56,10 +56,10 @@ def combine(wl_dir: str, rain_dir: str, output_dir: str, wl_locations: str, rain
 
     if rain_by_range and not any(session_key(f) in rain_by_range for f in wl_files):
         raise ValueError('no rainfall session has the same date range as a water-level session; '
-                         'both datasets must be cut on the same 14-day grid (start 2005-01-01)')
+                         'both datasets must be cut on the same 14-day grid (same --start)')
     if discharge_by_range and not any(session_key(f) in discharge_by_range for f in wl_files):
         raise ValueError('no discharge session has the same date range as a water-level session; '
-                         'both datasets must be cut on the same 14-day grid (start 2005-01-01)')
+                         'both datasets must be cut on the same 14-day grid (same --start)')
 
     n_with_rain = 0
     n_with_discharge = 0

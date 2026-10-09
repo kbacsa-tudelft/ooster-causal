@@ -12,7 +12,6 @@
 #   predict_chunk_size  default 512 (lower this if validation/scoring OOMs at this channel count -
 #                        see predict_residuals in cuts_plus_rca.py)
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
 TOTAL_EPOCH="${1:-2}"
 PREDICT_CHUNK_SIZE="${2:-512}"

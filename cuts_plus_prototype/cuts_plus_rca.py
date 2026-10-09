@@ -31,6 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from cuts_plus import MultiCAD  # noqa: E402  (vendor/cuts_plus.py)
 from utils.logger import MyLogger  # noqa: E402  (vendor/utils/logger.py)
 
+import flood_labels  # noqa: E402
+import mask_flood_events  # noqa: E402
+
 from aerca import (  # noqa: E402
     eval_causal_structure,
     eval_causal_structure_binary,
@@ -115,6 +118,17 @@ class CUTSPlusRCAConfig:
     n_folds: int = 1
     fold: int = 0  # which of the n_folds stripes to EXCLUDE from training this run (0-indexed);
     # must satisfy 0 <= fold < n_folds
+
+    # Flood-event root-cause analysis (real-data pipeline only; ignored for synthetic data). Empty
+    # (default) disables this entirely - behavior is then unchanged from before this was added.
+    # flood_events_csv points at flood_events.py's events.csv; station_events.csv (used for the
+    # per-channel root-cause labels) is expected alongside it in the same directory. Flood windows at
+    # or above flood_min_alert are masked to NaN (same convention as mask_flood_events.py) in the
+    # training and validation sessions only, so the causal graph is learned from normal conditions;
+    # score (held-out) sessions are left untouched so their real flood-period values are available to
+    # evaluate root-cause ranking (AC@k) against the station(s) that actually triggered each event.
+    flood_events_csv: str = ''
+    flood_min_alert: str = 'medium'
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -425,15 +439,17 @@ def fit_pot_thresholds(z_scores_val: np.ndarray, risk, initial_level, num_candid
 def score_session(multicad: MultiCAD, data_2d: np.ndarray, median, std, pot_thresholds, device,
                    mask: np.ndarray = None, chunk_size: int = 512):
     """Scores one (already-normalized) session against thresholds fit on validation data. Returns
-    (z_scores, flags, observed) with flags[t, i] True where variable i's residual at time t exceeds
-    its POT threshold - i.e. a candidate anomaly, with no label to check it against. `observed[t, i]`
-    is 1 where that position was a real (not imputed) reading - callers should ignore flags/z_scores
-    where observed is 0."""
+    (residuals, z_scores, flags, observed) with flags[t, i] True where variable i's residual at time t
+    exceeds its POT threshold - i.e. a candidate anomaly, with no label to check it against.
+    `observed[t, i]` is 1 where that position was a real (not imputed) reading - callers should ignore
+    flags/z_scores where observed is 0. `residuals` is returned (rather than just z_scores) so a
+    caller with real anomaly labels for this session (see root_cause_analysis) can evaluate against
+    them without a second forward pass through the model."""
     residuals, observed = predict_residuals(multicad, data_2d, device, mask=mask, chunk_size=chunk_size)
     std_safe = np.where(std == 0, 1e-8, std)
     z_scores = (residuals - median) / std_safe
     flags = z_scores > pot_thresholds[None, :]
-    return z_scores, flags, observed
+    return residuals, z_scores, flags, observed
 
 
 def causal_discovery_eval(graph: np.ndarray, causal_struct_value: np.ndarray, causal_quantile: float):
@@ -593,6 +609,19 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     print(f'Sessions: {len(train_ids)} train, {len(val_ids)} val, {len(score_ids)} score '
           f'(out of {len(session_ids)} total)')
 
+    station_events_csv = None
+    flood_windows = []
+    if config.flood_events_csv:
+        station_events_csv = os.path.join(os.path.dirname(config.flood_events_csv), 'station_events.csv')
+        flood_windows = mask_flood_events.load_windows(config.flood_events_csv, config.flood_min_alert)
+        masked_sessions = 0
+        for sid in pool_ids + val_ids:
+            series_dict[sid], hit = mask_flood_events.mask_dataframe(series_dict[sid], flood_windows)
+            masked_sessions += int(hit.any())
+        print(f'Flood RCA: masked {config.flood_min_alert}+ alert windows out of {masked_sessions} of '
+              f'{len(pool_ids) + len(val_ids)} train/val session(s); score sessions left untouched so '
+              f'real flood-period values are available to evaluate root-cause ranking against.')
+
     channel_names = list(series_dict[session_ids[0]].columns)
 
     # A channel observed in less than min_channel_availability of training rows has too little (or
@@ -697,12 +726,16 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
         print(f'{len(unscoreable)} channel(s) have too little validation data to set an anomaly '
               f'threshold, so they will never be flagged: {unscoreable}')
 
+    station_windows = (flood_labels.load_station_windows(station_events_csv, config.flood_min_alert)
+                        if station_events_csv else [])
+
     print('=' * 50)
     print('Scoring held-out sessions (no ground truth - reporting flagged fractions, not accuracy):')
     for sid in score_ids:
         filled, mask = session_data_and_mask(series_dict[sid][channel_names])
-        z_scores, flags, observed = score_session(multicad, normalize(filled), median, std, pot_thresholds,
-                                                    device, mask=mask, chunk_size=config.predict_chunk_size)
+        residuals, z_scores, flags, observed = score_session(
+            multicad, normalize(filled), median, std, pot_thresholds, device, mask=mask,
+            chunk_size=config.predict_chunk_size)
         flagged_fraction = flags[observed > 0].mean() if observed.sum() > 0 else float('nan')
         per_var_fraction = np.array([
             flags[observed[:, c] > 0, c].mean() if observed[:, c].sum() > 0 else np.nan
@@ -716,6 +749,23 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
         np.save(os.path.join(save_dir, f'cuts_plus_score_{sid}_z.npy'), z_scores)
         np.save(os.path.join(save_dir, f'cuts_plus_score_{sid}_flags.npy'), flags)
         np.save(os.path.join(save_dir, f'cuts_plus_score_{sid}_observed.npy'), observed)
+
+        if station_windows:
+            labels = flood_labels.build_channel_labels(channel_names, series_dict[sid].index, station_windows)
+            # root_cause_analysis aligns labels[input_step:] against residuals (predict_residuals'
+            # windowing) - check positives survive that slice, not just presence anywhere in the session.
+            if labels[config.input_step:].sum() > 0:
+                rc_metrics = root_cause_analysis(residuals, labels, median, std, config.risk,
+                                                  config.initial_level, config.num_candidates,
+                                                  config.input_step)
+                print(f'  {sid}: flood root-cause AC@1={rc_metrics["ac@1"]:.3f} '
+                      f'AC@5={rc_metrics["ac@5"]:.3f} Avg@10={rc_metrics["avg@10"]:.3f} '
+                      f'({int(labels.sum())} labeled (timestep, station) flood exceedance(s))')
+                log.log_metrics({f'test/root_cause_{sid}_{k}': float(v) for k, v in rc_metrics.items()},
+                                 config.total_epoch)
+                np.save(os.path.join(save_dir, f'cuts_plus_rca_{sid}_labels.npy'), labels)
+            else:
+                print(f'  {sid}: no flood exceedance overlaps this session - skipping labeled root-cause eval')
 
     edge_strength = graph.copy()
     np.fill_diagonal(edge_strength, 0.0)

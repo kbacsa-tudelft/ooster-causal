@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Sets up a private Python environment and runs download_rws_waterlevel.py with the full 2005-2025 range.
+# Sets up a private Python environment and runs download_rws_waterlevel.py with the full 1950-2025
+# range. Historical coverage varies by station - the script already tries every measuring-device code
+# a station's catalog entry lists, picking up whichever era-appropriate one has data, so no special
+# handling is needed here for that; expect far fewer stations and coarser cadence before the 1990s-2000s.
 #
 # Safe to interrupt and rerun with the same arguments: finished years and sessions are skipped.
+#
+# Run from the repository root.
 #
 # Usage:
 #   cuts_plus_prototype/run_rws_download.sh [output_dir] [extra args for download_rws_waterlevel.py]
 #
-#   output_dir  default rws_waterinfo (relative to the repository root)
+#   output_dir  default rws_waterinfo (relative to the current directory)
 #
 # Long run: start it detached so it survives closing the terminal:
 #   nohup cuts_plus_prototype/run_rws_download.sh > rws_download.log 2>&1 &
 #   tail -f rws_download.log
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
 OUT_DIR="${1:-rws_waterinfo}"
 shift || true
@@ -28,7 +32,7 @@ fi
 echo "=== downloading to $OUT_DIR ==="
 "$VENV/bin/python" -u cuts_plus_prototype/download_rws_waterlevel.py \
   --out "$OUT_DIR" \
-  --start 2005-01-01 --end 2025-01-01 \
+  --start 1950-01-01 --end 2025-01-01 \
   --workers 10 \
   "$@"
 

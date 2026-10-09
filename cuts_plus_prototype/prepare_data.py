@@ -36,6 +36,9 @@ What this does, per session file:
 Then writes every session to `--output-dir` and a normalization_stats.json (per-channel mean/std over
 the whole prepared dataset) alongside it.
 
+`--start` drops sessions before a given date, matched against the date range encoded in each session's
+filename (e.g. to exclude an earlier, lower-quality era from the resampled output without re-downloading).
+
 Usage:
     python3 cuts_plus_prototype/prepare_data.py --input-dir two_week_chunks --output-dir two_week_chunks_full \
         --rain-window 6h
@@ -44,10 +47,13 @@ import argparse
 import glob
 import json
 import os
+import re
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+
+RANGE_RE = re.compile(r'(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})')
 
 
 def scan_columns_and_freq(files: list) -> tuple:
@@ -76,10 +82,24 @@ def scan_columns_and_freq(files: list) -> tuple:
 
 
 def prepare(input_dir: str, output_dir: str, freq: str = 'auto', min_rows: int = 144,
-            rain_window: str = None):
+            rain_window: str = None, start: str = None):
     files = sorted(glob.glob(os.path.join(input_dir, '*.parquet')))
     if not files:
         raise ValueError(f'No .parquet files found in {input_dir}')
+
+    if start:
+        cutoff = pd.Timestamp(start)
+        kept = []
+        for f in files:
+            m = RANGE_RE.search(os.path.basename(f))
+            if not m:
+                raise ValueError(f'--start given but no date range found in filename: {f}')
+            if pd.Timestamp(m.group(1)) >= cutoff:
+                kept.append(f)
+        print(f'--start {start}: keeping {len(kept)}/{len(files)} session(s)')
+        files = kept
+        if not files:
+            raise ValueError(f'No sessions on/after --start {start}')
 
     print(f'Scanning {len(files)} raw session(s) (schema/index only)...')
     channel_names, coarsest_delta, total_dupes = scan_columns_and_freq(files)
@@ -164,8 +184,11 @@ def main():
     parser.add_argument('--rain-window', default=None,
                          help='replace each RH_* channel with its rolling sum over this window (e.g. '
                               '"6h") instead of the raw per-interval amount; omit to leave RH_* as-is')
+    parser.add_argument('--start', default=None,
+                         help='drop sessions starting before this date (YYYY-MM-DD), matched against '
+                              'the date range in each session filename; omit to include everything')
     args = parser.parse_args()
-    prepare(args.input_dir, args.output_dir, args.freq, args.min_rows, args.rain_window)
+    prepare(args.input_dir, args.output_dir, args.freq, args.min_rows, args.rain_window, args.start)
 
 
 if __name__ == '__main__':
