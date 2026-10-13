@@ -40,6 +40,10 @@ POLICIES=(
   "none"
   "rate_0.1_after_10"
   "rate_0.3_after_10"
+  "every_1"
+  "every_2"
+  "every_3"
+  "every_4"
   "every_5"
   "every_10"
 )
