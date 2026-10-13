@@ -53,7 +53,7 @@ class CUTSPlusRCAConfig:
     shared_weights_decoder: bool = False
     concat_h: bool = True
     input_step: int = 1
-    batch_size: int = 128
+    batch_size: int = 256
 
     # Optimization
     total_epoch: int = 30
