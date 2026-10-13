@@ -1,5 +1,5 @@
 # Vendored (near-verbatim) from https://github.com/jarrycyx/UNN/blob/main/CUTS_Plus/cuts_plus.py (MIT license,
-# see ../LICENSE). Nine deliberate deviations from upstream, kept as the only edits so this stays
+# see ../LICENSE). Ten deliberate deviations from upstream, kept as the only edits so this stays
 # otherwise faithful to the source:
 #   1. The trailing `if __name__ == "__main__":` block was removed: it referenced a yaml file not
 #      present in the published CUTS_Plus subfolder and called main() with the wrong arity, since the
@@ -70,6 +70,13 @@
 #      like any other edge. Added so a caller with known-exogenous variables (e.g. rainfall, which
 #      nothing in a water-level/discharge dataset can physically cause) can rule out that whole
 #      direction instead of leaving it to be discovered from correlation alone.
+#   10. Bug fix: the fill_policy="every_N" branch in MultiCAD.train() reads data_pred, which is only
+#       ever assigned inside the epoch loop's own batch loop, further down. With update_every=1 (i.e.
+#       fill_policy="every_1"), the branch's condition is already true on the very first iteration of
+#       the epoch loop, before any batch has run - crashing with UnboundLocalError. data_pred is now
+#       also initialized to the pre-training working data right before the epoch loop, making that
+#       first possible trigger a no-op, which is the correct behavior anyway (there is no model
+#       prediction yet to bootstrap from before any training has happened).
 
 import logging
 import os, sys
@@ -366,6 +373,14 @@ class MultiCAD(object):
                 Graph = Graph * self.allowed_mask.cpu().numpy()
         pbar = tqdm.tqdm(total=self.args.total_epoch, initial=start_epoch)
         data_interp = deepcopy(data)
+        # Bug fix (deviation 10): the "every_N" fill_policy branch below reads data_pred, which is
+        # otherwise only ever assigned inside the epoch loop's own batch loop (after this point) - so
+        # fill_policy="every_1" (update_every=1, triggers at epoch_i=0, the very first iteration)
+        # crashed with UnboundLocalError before a single batch had run. Initializing it to the
+        # pre-training working data makes that first possible trigger a no-op (data = data_pred =
+        # data), which is the correct behavior anyway: there is no model prediction yet to bootstrap
+        # from at epoch 0.
+        data_pred = deepcopy(data)
         original_mask = deepcopy(observ_mask)
         auc = 0
         for epoch_i in range(start_epoch, self.args.total_epoch):
