@@ -17,10 +17,17 @@
 # flood_aware_split config field.
 #
 # flood_events_output/events.csv + station_events.csv must already exist - build them once with:
-#   python3 flood_events.py --data-dir rws_waterinfo_adapted_full --out flood_events_output
+#   python3 cuts_plus_prototype/prepare_rws_waterinfo.py --input-dir rws_waterinfo --output-dir /tmp/wl_adapted
+#   python3 flood_events.py --data-dir /tmp/wl_adapted --out flood_events_output
 # (national tables, not Limburg-specific - the same ones run_rws_waterinfo_pipeline.sh uses; a station's
 # event still routes the whole dataset's session for that window, per flood_events.py's own convention
-# that a flood is a regime shift felt by every channel, not just the station(s) that triggered it).
+# that a flood is a regime shift felt by every channel, not just the station(s) that triggered it.
+# flood_events.py needs an occluded directory, not the raw rws_waterinfo/ - this is a small, one-off,
+# infrequently-rebuilt artifact, so a scratch adapted copy built just for this is fine; it doesn't need
+# to be the Limburg dataset build below, which is water-level-only and region-filtered separately).
+#
+# --region limburg below is built on the fly by build_dataset.sh (water level only, matching the
+# `1974`/`imputation`/sweep_fill_policy.sh runs this eval was built to extend).
 #
 # --fill-policy defaults to cuts_plus_rca.py's own default (rate_0.1_after_10, chosen from
 # sweep_fill_policy.sh's results) but is passed explicitly here for clarity.
@@ -41,7 +48,7 @@ TOTAL_EPOCH="${1:-50}"
 PREDICT_CHUNK_SIZE="${2:-32}"
 FLOOD_MIN_ALERT="${3:-medium}"
 
-DATA_DIR=rws_waterinfo_limburg
+DATA_DIR=cuts_plus_prototype/scratch/limburg_flood_eval_dataset
 FLOOD_EVENTS_CSV=flood_events_output/events.csv
 FILL_POLICY=rate_0.1_after_10
 LAMBDA_S_START=0.3
@@ -54,9 +61,13 @@ RUN_DIR=cuts_plus_prototype/scratch/limburg_flood_eval
 
 if [ ! -f "$FLOOD_EVENTS_CSV" ]; then
   echo "$FLOOD_EVENTS_CSV not found - build it first with:"
-  echo "  python3 flood_events.py --data-dir rws_waterinfo_adapted_full --out flood_events_output"
+  echo "  python3 cuts_plus_prototype/prepare_rws_waterinfo.py --input-dir rws_waterinfo --output-dir /tmp/wl_adapted"
+  echo "  python3 flood_events.py --data-dir /tmp/wl_adapted --out flood_events_output"
   exit 1
 fi
+
+echo "=== Building Limburg dataset -> $DATA_DIR ==="
+cuts_plus_prototype/build_dataset.sh "$DATA_DIR" limburg rws_waterinfo "" ""
 
 echo "=== Training on $DATA_DIR ($TOTAL_EPOCH epoch(s), fill_policy=$FILL_POLICY, flood_min_alert=$FLOOD_MIN_ALERT) ==="
 python3 cuts_plus_prototype/cuts_plus_rca.py \
