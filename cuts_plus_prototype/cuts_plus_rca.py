@@ -130,11 +130,23 @@ class CUTSPlusRCAConfig:
     flood_events_csv: str = ''
     flood_min_alert: str = 'medium'
 
+    # Opt-in alternative to the chronological val_ratio/test_ratio split above (default False: that
+    # existing behavior, used by every run so far, is unaffected). When True, every session that
+    # touches a flood_min_alert+ window goes to score (test) outright, instead of being NaN-masked
+    # mid-session and kept in train/val - so flood samples are never partially diluted into training,
+    # and score naturally also keeps the surrounding normal timesteps of those same sessions (most of
+    # a session isn't inside the flood window), giving a test set with both flood and normal samples to
+    # evaluate flood detection against (root_cause_analysis's AC@k, already computed when
+    # flood_events_csv is set). The remaining flood-free sessions split train/val by val_ratio (e.g.
+    # val_ratio=0.2 -> 80/20); test_ratio is unused in this mode, since test's size is however many
+    # sessions happen to touch a flood, not a fixed fraction. Requires flood_events_csv.
+    flood_aware_split: bool = False
+
     # CUTS+'s own iterative imputation (vendor/cuts_plus.py's MultiCAD.train): every epoch it predicts
     # a value for every masked/missing position from its own learned dynamics (data_pred). Whether
     # that prediction ever replaces the static mean-fill used as the working data is controlled here -
-    # 'none' (default) never updates it, so missing positions stay at the training mean for the whole
-    # run (this pipeline's behavior before this option existed). Two policies turn the update on:
+    # 'none' never updates it, so missing positions stay at the training mean for the whole run (this
+    # pipeline's behavior before this option existed). Two policies turn the update on:
     #   'rate_X_after_Y'  after epoch Y, each epoch blends working data toward data_pred at rate X
     #                     (e.g. 'rate_0.1_after_5') - the observation mask is untouched, so these
     #                     positions still never contribute to the training loss as targets, only as
@@ -144,7 +156,12 @@ class CUTSPlusRCAConfig:
     #                     positions start counting as real targets in the loss, trusting the model's
     #                     own predictions as ground truth. Stronger, more self-reinforcing; prefer
     #                     'rate_X_after_Y' unless this is specifically what's wanted.
-    fill_policy: str = 'none'
+    # Default 'rate_0.1_after_10': cuts_plus_prototype/sweep_fill_policy.sh's fill_policy sweep (see its
+    # scratch/fill_policy_sweep results) found this was consistently among the best-generalizing
+    # policies on held-out score sessions (mean z^2 of prediction residuals) across both a tide- and a
+    # river-dominated region, while aggressive every_N bootstrapping (especially every_1) overfit to
+    # its own self-reinforced training labels and generalized the worst of all policies tried.
+    fill_policy: str = 'rate_0.1_after_10'
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -602,10 +619,12 @@ def run_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_plus_rca')
 
 def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_plus_rca_real'):
     """Real-data counterpart to run_pipeline: no ground truth, so instead of computing AUROC/AC@k
-    against labels that don't exist, it trains on all sessions but the most recent val_ratio/
-    test_ratio fractions (held out as whole sessions, never sliced, so nothing straddles a
-    train/val/score boundary), fits residual + POT thresholds on the validation sessions, and scores
-    the held-out sessions - saving flagged anomalies and the learned causal graph to save_dir."""
+    against labels that don't exist, it trains on all sessions but a held-out val/score fraction (whole
+    sessions, never sliced, so nothing straddles a train/val/score boundary) - by default the most
+    recent val_ratio/test_ratio fraction of sessions chronologically, or (config.flood_aware_split) every
+    flood-touching session routed to score and the remaining flood-free sessions split train/val by
+    val_ratio - fits residual + POT thresholds on the validation sessions, and scores the held-out
+    sessions - saving flagged anomalies and the learned causal graph to save_dir."""
     set_seed(config.seed)
     device = config.device or ('cuda' if torch.cuda.is_available() else 'cpu')
     if device == 'cuda':
@@ -613,13 +632,13 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
 
     series_dict, means, stds = load_real_sessions(config.data_dir)
     session_ids = sorted(series_dict.keys())
-    n_score = max(1, round(config.test_ratio * len(session_ids)))
-    n_val = max(1, round(config.val_ratio * len(session_ids)))
-    if len(session_ids) <= n_val + n_score:
-        raise ValueError(
-            f'Only {len(session_ids)} sessions found in {config.data_dir}; need more than '
-            f'val+score ({n_val}+{n_score}) so at least one whole session is left for training.'
-        )
+
+    station_events_csv = None
+    flood_windows = []
+    if config.flood_events_csv:
+        station_events_csv = os.path.join(os.path.dirname(config.flood_events_csv), 'station_events.csv')
+        flood_windows = mask_flood_events.load_windows(config.flood_events_csv, config.flood_min_alert)
+
     if config.n_folds < 1:
         raise ValueError(f'--n-folds must be >= 1 (got {config.n_folds}).')
     if not (0 <= config.fold < config.n_folds):
@@ -627,9 +646,41 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
             f'--fold ({config.fold}) must satisfy 0 <= fold < --n-folds ({config.n_folds}).'
         )
 
-    pool_ids = session_ids[:-(n_val + n_score)]
-    val_ids = session_ids[-(n_val + n_score):-n_score]
-    score_ids = session_ids[-n_score:]
+    if config.flood_aware_split:
+        if not config.flood_events_csv:
+            raise ValueError('--flood-aware-split requires --flood-events-csv, to know which sessions '
+                              'touch a flood window.')
+        flood_ids, normal_ids = [], []
+        for sid in session_ids:
+            idx = series_dict[sid].index
+            overlaps = any(start < idx.max() and end > idx.min() for start, end in flood_windows)
+            (flood_ids if overlaps else normal_ids).append(sid)
+        if not flood_ids:
+            raise ValueError(f'--flood-aware-split requested but no session touches a '
+                              f'{config.flood_min_alert}+ alert window - lower --flood-min-alert or '
+                              f'check --flood-events-csv.')
+        score_ids = flood_ids
+        n_val = max(1, round(config.val_ratio * len(normal_ids)))
+        if len(normal_ids) <= n_val:
+            raise ValueError(f'Only {len(normal_ids)} flood-free session(s) found; need more than '
+                              f'val ({n_val}) so at least one is left for training.')
+        pool_ids = normal_ids[:-n_val]
+        val_ids = normal_ids[-n_val:]
+        print(f'Flood-aware split: {len(flood_ids)} session(s) touch a {config.flood_min_alert}+ '
+              f'alert window -> score (test); remaining {len(normal_ids)} flood-free session(s) split '
+              f'{1 - config.val_ratio:.0%}/{config.val_ratio:.0%} train/val (--test-ratio ignored).')
+    else:
+        n_score = max(1, round(config.test_ratio * len(session_ids)))
+        n_val = max(1, round(config.val_ratio * len(session_ids)))
+        if len(session_ids) <= n_val + n_score:
+            raise ValueError(
+                f'Only {len(session_ids)} sessions found in {config.data_dir}; need more than '
+                f'val+score ({n_val}+{n_score}) so at least one whole session is left for training.'
+            )
+        pool_ids = session_ids[:-(n_val + n_score)]
+        val_ids = session_ids[-(n_val + n_score):-n_score]
+        score_ids = session_ids[-n_score:]
+
     train_ids = split_sessions_for_fold(pool_ids, config.n_folds, config.fold)
     if config.n_folds > 1:
         print(f'K-fold: {config.n_folds} folds, fold {config.fold} withholds '
@@ -637,11 +688,7 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     print(f'Sessions: {len(train_ids)} train, {len(val_ids)} val, {len(score_ids)} score '
           f'(out of {len(session_ids)} total)')
 
-    station_events_csv = None
-    flood_windows = []
     if config.flood_events_csv:
-        station_events_csv = os.path.join(os.path.dirname(config.flood_events_csv), 'station_events.csv')
-        flood_windows = mask_flood_events.load_windows(config.flood_events_csv, config.flood_min_alert)
         masked_sessions = 0
         for sid in pool_ids + val_ids:
             series_dict[sid], hit = mask_flood_events.mask_dataframe(series_dict[sid], flood_windows)

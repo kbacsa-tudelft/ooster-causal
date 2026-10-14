@@ -140,3 +140,55 @@ def test_run_real_data_pipeline_labels_flood_in_score_session_only(tmp_path):
     assert labels[:, 0].sum() == 10  # only WL_stationa, only the 10 flagged timesteps
     assert labels[:, 1].sum() == 0
     assert labels[:, 2].sum() == 0
+
+
+def test_flood_aware_split_routes_the_flood_session_to_score_even_if_not_chronologically_last(tmp_path):
+    rng = np.random.default_rng(0)
+    channels = ['WL_stationa', 'WL_stationb', 'RH_rain1']
+    data_dir = tmp_path / 'data'
+    data_dir.mkdir()
+
+    # 6 sessions, flood spike in the MIDDLE one (session_2) - the chronological val_ratio/test_ratio
+    # split would put this in train/pool, not score. flood_aware_split must override that.
+    starts = pd.date_range('2020-01-01', periods=6, freq='10D')
+    flood_index = None
+    for i, start in enumerate(starts):
+        if i == 2:
+            flood_index = _write_session(data_dir / f'session_{i}.parquet', start, periods=300,
+                                          freq='10min', channels=channels, rng=rng,
+                                          flood_cols=['WL_stationa'], flood_slice=slice(100, 110))
+        else:
+            _write_session(data_dir / f'session_{i}.parquet', start, periods=80, freq='10min',
+                            channels=channels, rng=rng)
+
+    flood_dir = tmp_path / 'flood_events_output'
+    flood_dir.mkdir()
+    pd.DataFrame([{
+        'start': flood_index[100].date().isoformat(), 'end': flood_index[109].date().isoformat(),
+        'alert': 'medium',
+    }]).to_csv(flood_dir / 'events.csv', index=False)
+    pd.DataFrame([{
+        'station': 'Station A', 'code': 'stationa', 'kind': 'river',
+        'start': flood_index[100].isoformat(), 'end': flood_index[109].isoformat(),
+        'peak_time': flood_index[105].isoformat(), 'peak_level': 999, 'alert': 'medium', 'detail': '',
+    }]).to_csv(flood_dir / 'station_events.csv', index=False)
+
+    config = CUTSPlusRCAConfig(
+        data_dir=str(data_dir), save_dir=str(tmp_path / 'models'), log_dir=str(tmp_path / 'runs'),
+        total_epoch=2, n_groups=3, group_policy='multiply_2_every_1', seed=0,
+        flood_events_csv=str(flood_dir / 'events.csv'), flood_min_alert='medium',
+        flood_aware_split=True, val_ratio=0.2,
+    )
+
+    run_real_data_pipeline(config, log_dir_name='test_flood_aware_split')
+
+    model_dir = str(tmp_path / 'models')
+    # session_2 (the flood session) was scored - only score sessions get these artifacts.
+    assert os.path.exists(os.path.join(model_dir, 'cuts_plus_score_session_2_flags.npy'))
+    assert os.path.exists(os.path.join(model_dir, 'cuts_plus_rca_session_2_labels.npy'))
+    labels = np.load(os.path.join(model_dir, 'cuts_plus_rca_session_2_labels.npy'))
+    assert labels[:, 0].sum() == 10
+
+    # none of the other 5 (flood-free) sessions were scored - they all went to train/val instead.
+    for i in [0, 1, 3, 4, 5]:
+        assert not os.path.exists(os.path.join(model_dir, f'cuts_plus_score_session_{i}_flags.npy'))
