@@ -25,6 +25,10 @@
 # --fill-policy defaults to cuts_plus_rca.py's own default (rate_0.1_after_10, chosen from
 # sweep_fill_policy.sh's results) but is passed explicitly here for clarity.
 #
+# --held-out-eval-every 5 logs held_out/val_mse to TensorBoard every 5 epochs - the genuinely held-out
+# counterpart to the training-only S1/S2 loss curves, to check whether 50 epochs is actually the right
+# stopping point (see cuts_plus_rca.py's held_out_eval_every config field) rather than assuming it.
+#
 # Usage:
 #   cuts_plus_prototype/run_limburg_flood_eval.sh [total_epoch] [predict_chunk_size] [flood_min_alert]
 #
@@ -44,6 +48,7 @@ LAMBDA_S_START=0.3
 LAMBDA_S_END=0.03
 VAL_RATIO=0.1
 TEST_RATIO=0.1
+HELD_OUT_EVAL_EVERY=5
 
 RUN_DIR=cuts_plus_prototype/scratch/limburg_flood_eval
 
@@ -66,8 +71,11 @@ python3 cuts_plus_prototype/cuts_plus_rca.py \
   --flood-aware-split true \
   --val-ratio "$VAL_RATIO" \
   --test-ratio "$TEST_RATIO" \
+  --held-out-eval-every "$HELD_OUT_EVAL_EVERY" \
   --save-dir "$RUN_DIR/models" \
   --log-dir "$RUN_DIR/runs"
 
-echo "Done. Flood detection (AC@k) was printed per flood score session above, and logged to TensorBoard:"
+echo "Done. Flood detection (AC@k) was printed per flood score session above, and logged to TensorBoard,"
+echo "along with held_out/val_mse every $HELD_OUT_EVAL_EVERY epochs (check whether it's still improving"
+echo "by epoch $TOTAL_EPOCH or has already peaked):"
 echo "  tensorboard --logdir $RUN_DIR/runs"
