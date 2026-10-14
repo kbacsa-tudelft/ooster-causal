@@ -5,12 +5,16 @@
 # land in train, val, or score depending only on when it happened to occur.
 #
 # --flood-aware-split routes every session touching a --flood-min-alert+ national event window straight
-# to score (test), instead of masking it out of train/val mid-session; the remaining flood-free sessions
-# split train/val by --val-ratio (0.2 below -> 80/20). Validation stays flood-free, so residual median/
-# std/POT thresholds are calibrated on pure-normal data; score then contains both the flood window itself
-# and the normal timesteps surrounding it in those same sessions, so true/false-positive flood detection
-# (root_cause_analysis's AC@k, computed automatically below since --flood-events-csv is set) has both
-# positive and negative samples to work with. See cuts_plus_rca.py's flood_aware_split config field.
+# to score (test), instead of masking it out of train/val mid-session, then pads score with the most
+# recent flood-free sessions up to the --test-ratio target (0.1 below) and splits the remaining
+# flood-free sessions train/val by --val-ratio (0.1 below) - 0.8/0.1/0.1 overall, confirmed against this
+# dataset's actual flood count (33 of 1330 Limburg sessions touch a medium+ window, well under the 133-
+# session test target) to give an exact 1064/133/133 train/val/score split. Validation stays flood-free,
+# so residual median/std/POT thresholds are calibrated on pure-normal data; score then contains both the
+# flood window itself and the normal timesteps surrounding it in those same sessions, so true/false-
+# positive flood detection (root_cause_analysis's AC@k, computed automatically below since
+# --flood-events-csv is set) has both positive and negative samples to work with. See cuts_plus_rca.py's
+# flood_aware_split config field.
 #
 # flood_events_output/events.csv + station_events.csv must already exist - build them once with:
 #   python3 flood_events.py --data-dir rws_waterinfo_adapted_full --out flood_events_output
@@ -38,7 +42,8 @@ FLOOD_EVENTS_CSV=flood_events_output/events.csv
 FILL_POLICY=rate_0.1_after_10
 LAMBDA_S_START=0.3
 LAMBDA_S_END=0.03
-VAL_RATIO=0.2
+VAL_RATIO=0.1
+TEST_RATIO=0.1
 
 RUN_DIR=cuts_plus_prototype/scratch/limburg_flood_eval
 
@@ -60,6 +65,7 @@ python3 cuts_plus_prototype/cuts_plus_rca.py \
   --flood-min-alert "$FLOOD_MIN_ALERT" \
   --flood-aware-split true \
   --val-ratio "$VAL_RATIO" \
+  --test-ratio "$TEST_RATIO" \
   --save-dir "$RUN_DIR/models" \
   --log-dir "$RUN_DIR/runs"
 

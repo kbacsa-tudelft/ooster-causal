@@ -137,9 +137,11 @@ class CUTSPlusRCAConfig:
     # and score naturally also keeps the surrounding normal timesteps of those same sessions (most of
     # a session isn't inside the flood window), giving a test set with both flood and normal samples to
     # evaluate flood detection against (root_cause_analysis's AC@k, already computed when
-    # flood_events_csv is set). The remaining flood-free sessions split train/val by val_ratio (e.g.
-    # val_ratio=0.2 -> 80/20); test_ratio is unused in this mode, since test's size is however many
-    # sessions happen to touch a flood, not a fixed fraction. Requires flood_events_csv.
+    # flood_events_csv is set). val_ratio/test_ratio are still honored as targets (fractions of all
+    # sessions, e.g. 0.8/0.1/0.1 train/val/test): score is padded with the most recent flood-free
+    # sessions up to the test_ratio target (or just kept larger than requested if there are more flood
+    # sessions than that target - a flood session is never dropped out of score to hit the ratio), and
+    # the remaining flood-free sessions split train/val by val_ratio. Requires flood_events_csv.
     flood_aware_split: bool = False
 
     # CUTS+'s own iterative imputation (vendor/cuts_plus.py's MultiCAD.train): every epoch it predicts
@@ -659,16 +661,32 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
             raise ValueError(f'--flood-aware-split requested but no session touches a '
                               f'{config.flood_min_alert}+ alert window - lower --flood-min-alert or '
                               f'check --flood-events-csv.')
-        score_ids = flood_ids
-        n_val = max(1, round(config.val_ratio * len(normal_ids)))
-        if len(normal_ids) <= n_val:
-            raise ValueError(f'Only {len(normal_ids)} flood-free session(s) found; need more than '
-                              f'val ({n_val}) so at least one is left for training.')
-        pool_ids = normal_ids[:-n_val]
-        val_ids = normal_ids[-n_val:]
-        print(f'Flood-aware split: {len(flood_ids)} session(s) touch a {config.flood_min_alert}+ '
-              f'alert window -> score (test); remaining {len(normal_ids)} flood-free session(s) split '
-              f'{1 - config.val_ratio:.0%}/{config.val_ratio:.0%} train/val (--test-ratio ignored).')
+
+        # val_ratio/test_ratio are targets, as fractions of ALL sessions (same convention as the
+        # chronological branch below) - but every flood session must land in score regardless of that
+        # target, so score is padded with the most recent flood-free sessions up to n_score_target,
+        # or (if there are more flood sessions than the target itself) just kept larger than requested
+        # rather than ever dropping a flood session out of score.
+        n_score_target = max(1, round(config.test_ratio * len(session_ids)))
+        n_val = max(1, round(config.val_ratio * len(session_ids)))
+        if len(flood_ids) > n_score_target:
+            print(f'Flood-aware split: {len(flood_ids)} flood session(s) exceed the --test-ratio '
+                  f'target of {n_score_target} - keeping all of them in score anyway (score will be '
+                  f'larger than requested rather than dropping a flood session).')
+        n_pad = max(0, n_score_target - len(flood_ids))
+        test_pad_ids = normal_ids[-n_pad:] if n_pad else []
+        remaining_normal_ids = normal_ids[:-n_pad] if n_pad else normal_ids
+        if len(remaining_normal_ids) <= n_val:
+            raise ValueError(f'Only {len(remaining_normal_ids)} flood-free session(s) left after '
+                              f'padding score to {n_score_target}; need more than val ({n_val}) so at '
+                              f'least one is left for training.')
+        val_ids = remaining_normal_ids[-n_val:]
+        pool_ids = remaining_normal_ids[:-n_val]
+        score_ids = sorted(flood_ids + test_pad_ids)
+        print(f'Flood-aware split: {len(flood_ids)} session(s) touch a {config.flood_min_alert}+ alert '
+              f'window, padded with {len(test_pad_ids)} flood-free session(s) -> {len(score_ids)} score '
+              f'(target {n_score_target}); remaining {len(remaining_normal_ids)} flood-free session(s) '
+              f'split into {len(pool_ids)} train / {len(val_ids)} val.')
     else:
         n_score = max(1, round(config.test_ratio * len(session_ids)))
         n_val = max(1, round(config.val_ratio * len(session_ids)))

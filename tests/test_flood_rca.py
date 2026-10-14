@@ -192,3 +192,50 @@ def test_flood_aware_split_routes_the_flood_session_to_score_even_if_not_chronol
     # none of the other 5 (flood-free) sessions were scored - they all went to train/val instead.
     for i in [0, 1, 3, 4, 5]:
         assert not os.path.exists(os.path.join(model_dir, f'cuts_plus_score_session_{i}_flags.npy'))
+
+
+def test_flood_aware_split_pads_score_with_the_most_recent_flood_free_sessions(tmp_path):
+    rng = np.random.default_rng(0)
+    channels = ['WL_stationa', 'WL_stationb', 'RH_rain1']
+    data_dir = tmp_path / 'data'
+    data_dir.mkdir()
+
+    # 10 sessions, flood spike in session_2 only (1 flood session). val_ratio=0.1 -> n_val=1,
+    # test_ratio=0.3 -> n_score_target=3, so score should be session_2 padded with the 2 most recent
+    # flood-free sessions (session_8, session_9), leaving session_7 for val and 0..1,3..6 for train.
+    starts = pd.date_range('2020-01-01', periods=10, freq='10D')
+    flood_index = None
+    for i, start in enumerate(starts):
+        if i == 2:
+            flood_index = _write_session(data_dir / f'session_{i}.parquet', start, periods=300,
+                                          freq='10min', channels=channels, rng=rng,
+                                          flood_cols=['WL_stationa'], flood_slice=slice(100, 110))
+        else:
+            _write_session(data_dir / f'session_{i}.parquet', start, periods=80, freq='10min',
+                            channels=channels, rng=rng)
+
+    flood_dir = tmp_path / 'flood_events_output'
+    flood_dir.mkdir()
+    pd.DataFrame([{
+        'start': flood_index[100].date().isoformat(), 'end': flood_index[109].date().isoformat(),
+        'alert': 'medium',
+    }]).to_csv(flood_dir / 'events.csv', index=False)
+    pd.DataFrame([{
+        'station': 'Station A', 'code': 'stationa', 'kind': 'river',
+        'start': flood_index[100].isoformat(), 'end': flood_index[109].isoformat(),
+        'peak_time': flood_index[105].isoformat(), 'peak_level': 999, 'alert': 'medium', 'detail': '',
+    }]).to_csv(flood_dir / 'station_events.csv', index=False)
+
+    config = CUTSPlusRCAConfig(
+        data_dir=str(data_dir), save_dir=str(tmp_path / 'models'), log_dir=str(tmp_path / 'runs'),
+        total_epoch=2, n_groups=3, group_policy='multiply_2_every_1', seed=0,
+        flood_events_csv=str(flood_dir / 'events.csv'), flood_min_alert='medium',
+        flood_aware_split=True, val_ratio=0.1, test_ratio=0.3,
+    )
+
+    run_real_data_pipeline(config, log_dir_name='test_flood_aware_split_pad')
+
+    model_dir = str(tmp_path / 'models')
+    scored = [i for i in range(10)
+               if os.path.exists(os.path.join(model_dir, f'cuts_plus_score_session_{i}_flags.npy'))]
+    assert sorted(scored) == [2, 8, 9]  # flood session + the 2 most recent flood-free sessions
