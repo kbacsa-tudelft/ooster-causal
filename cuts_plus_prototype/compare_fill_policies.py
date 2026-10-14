@@ -29,10 +29,36 @@ def tail_mean(ea: EventAccumulator, tag: str, tail_frac: float = 0.1) -> float:
 
 
 def summarize_run(run_dir: str) -> dict:
+    # TensorBoard-sourced metrics are read whenever an event file exists, independent of whether the
+    # final graph was ever saved - a run that crashed after training but before its post-training save
+    # (e.g. on the pot()-raising root_cause_analysis bug this project hit once) still has a fully
+    # logged training history worth reading, not just a bare "incomplete".
+    summary = {'status': 'incomplete'}
+    event_files = glob.glob(os.path.join(run_dir, 'runs', '**', 'events.out.tfevents.*'), recursive=True)
+    if event_files:
+        ea = EventAccumulator(os.path.dirname(event_files[0]))
+        ea.Reload()
+        summary['s1_pred_loss'] = tail_mean(ea, 'latent_data_pred/pred_loss')
+        summary['s2_data_loss'] = tail_mean(ea, 'graph_discov/data_loss')
+        summary['sparsity_loss'] = tail_mean(ea, 'graph_discov/sparsity_loss')
+        summary['s2_over_s1'] = (summary['s2_data_loss'] / summary['s1_pred_loss']
+                                  if summary['s1_pred_loss'] else float('nan'))
+        if 'held_out/val_mse' in ea.Tags()['scalars']:
+            val_mse = ea.Scalars('held_out/val_mse')
+            best = min(val_mse, key=lambda e: e.value)
+            summary['held_out_val_mse_best'] = float(best.value)
+            summary['held_out_val_mse_best_epoch'] = best.step
+        else:
+            summary['held_out_val_mse_best'] = float('nan')
+            summary['held_out_val_mse_best_epoch'] = float('nan')
+
+    # diag_mean/diag_eroded_frac/diag_vs_hub_corr need the final saved graph - status stays
+    # 'incomplete' without it (now specifically meaning "no final graph", not "nothing to report at
+    # all"), but whatever TensorBoard metrics were read above are kept either way.
     graph_path = os.path.join(run_dir, 'models', 'cuts_plus_graph.npy')
     names_path = os.path.join(run_dir, 'models', 'channel_names.json')
     if not os.path.exists(graph_path) or not os.path.exists(names_path):
-        return {'status': 'incomplete'}
+        return summary
 
     graph = np.load(graph_path)  # row=effect, col=cause
     with open(names_path) as f:
@@ -45,28 +71,17 @@ def summarize_run(run_dir: str) -> dict:
     diag_vs_hub_corr = (float(np.corrcoef(diag, incoming_mass)[0, 1])
                          if diag.std() > 0 and incoming_mass.std() > 0 else float('nan'))
 
-    summary = {
-        'status': 'complete',
-        'n_channels': n_channels,
-        'diag_mean': float(diag.mean()),
-        'diag_eroded_frac': float((diag < 0.1).mean()),  # fraction of channels that lost their self-edge
-        'diag_vs_hub_corr': diag_vs_hub_corr,  # weak self-edge -> more spurious incoming edges, if positive
-    }
-
-    event_files = glob.glob(os.path.join(run_dir, 'runs', '**', 'events.out.tfevents.*'), recursive=True)
-    if event_files:
-        ea = EventAccumulator(os.path.dirname(event_files[0]))
-        ea.Reload()
-        summary['s1_pred_loss'] = tail_mean(ea, 'latent_data_pred/pred_loss')
-        summary['s2_data_loss'] = tail_mean(ea, 'graph_discov/data_loss')
-        summary['sparsity_loss'] = tail_mean(ea, 'graph_discov/sparsity_loss')
-        summary['s2_over_s1'] = (summary['s2_data_loss'] / summary['s1_pred_loss']
-                                  if summary['s1_pred_loss'] else float('nan'))
+    summary['status'] = 'complete'
+    summary['n_channels'] = n_channels
+    summary['diag_mean'] = float(diag.mean())
+    summary['diag_eroded_frac'] = float((diag < 0.1).mean())  # fraction of channels that lost their self-edge
+    summary['diag_vs_hub_corr'] = diag_vs_hub_corr  # weak self-edge -> more spurious incoming edges, if positive
     return summary
 
 
 def print_table(rows: list):
     cols = ['fill_policy', 'status', 's1_pred_loss', 's2_data_loss', 's2_over_s1', 'sparsity_loss',
+            'held_out_val_mse_best', 'held_out_val_mse_best_epoch',
             'diag_mean', 'diag_eroded_frac', 'diag_vs_hub_corr']
 
     def fmt(v):
