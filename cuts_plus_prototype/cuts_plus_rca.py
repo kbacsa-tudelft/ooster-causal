@@ -73,6 +73,15 @@ class CUTSPlusRCAConfig:
     show_graph_every: int = 1000  # effectively never - keep runs cheap
     graph_plot_every: int = 10  # log a labeled adjacency-matrix figure to TensorBoard every N epochs
 
+    # Real-data pipeline only (ignored for synthetic data, which has no val_ids): every this many
+    # epochs, scores the current (mid-training) model against the validation sessions and logs
+    # held_out/val_mse to TensorBoard - the genuinely held-out counterpart to latent_data_pred/
+    # pred_loss and graph_discov/data_loss, which are both measured on training data and can keep
+    # moving (even diverging, as seen on the fill_policy sweep's Limburg runs) well past the point
+    # where the model stops actually generalizing better. 0 (default) disables this entirely - no
+    # extra forward passes, so every existing run/script is unaffected unless this is set.
+    held_out_eval_every: int = 0
+
     # Root-cause / EVT thresholds (same semantics as aerca.AERCAConfig)
     causal_quantile: float = 0.80
     risk: float = 1e-2
@@ -784,6 +793,34 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
             log.log_figures(plot_labeled_adjacency(raw_graph.T, channel_names), name='causal_graph',
                              iters=epoch_i + 1)
 
+    # Precomputed once (model-independent) so held_out_eval below only has to redo the actual forward
+    # pass each time it fires, not session_data_and_mask/normalize too; also reused by the post-training
+    # val_pairs computation right after multicad.train() returns, which used to recompute this itself.
+    val_prepared = [(normalize(filled), mask) for vid in val_ids
+                     for filled, mask in [session_data_and_mask(series_dict[vid][channel_names])]]
+
+    def held_out_eval(epoch_i):
+        # latent_data_pred/pred_loss and graph_discov/data_loss are both measured on training data and
+        # can keep moving (even diverging - see the fill_policy sweep's Limburg runs) well past the
+        # point the model stops actually generalizing better; this is the genuinely held-out
+        # counterpart, scored against the current (mid-training) model exactly like the post-training
+        # val/score loops below do, so it's directly comparable to the final numbers they report.
+        if config.held_out_eval_every and (epoch_i + 1) % config.held_out_eval_every == 0:
+            residual_chunks, observed_chunks = [], []
+            for norm_filled, mask in val_prepared:
+                r, o = predict_residuals(multicad, norm_filled, device, mask=mask,
+                                          chunk_size=config.predict_chunk_size)
+                residual_chunks.append(r)
+                observed_chunks.append(o)
+            residual = np.concatenate(residual_chunks)
+            observed = np.concatenate(observed_chunks)
+            mse = float(np.mean(residual[observed > 0] ** 2)) if observed.sum() > 0 else float('nan')
+            log.log_metrics({'held_out/val_mse': mse}, epoch_i + 1)
+
+    def epoch_callback(epoch_i, raw_graph):
+        plot_epoch_graph(epoch_i, raw_graph)
+        held_out_eval(epoch_i)
+
     save_dir = os.path.join(os.getcwd(), config.save_dir)
     os.makedirs(save_dir, exist_ok=True)
     checkpoint_path = os.path.join(save_dir, 'checkpoint.pt')
@@ -797,7 +834,7 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     # interruption resumes automatically - train() loads it if present, and skips loading (a fresh
     # start) if this is the first run.
     graph = multicad.train(train_norm[:, :, None], train_mask[:, :, None], train_norm[:, :, None],
-                            true_cm=None, epoch_callback=plot_epoch_graph,
+                            true_cm=None, epoch_callback=epoch_callback,
                             checkpoint_path=checkpoint_path, checkpoint_every=config.checkpoint_every,
                             allowed_mask=allowed_mask)
     graph = graph.T
@@ -805,11 +842,9 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
     log.log_figures(plot_labeled_adjacency(graph, channel_names), name='causal_graph',
                      iters=config.total_epoch)
 
-    val_pairs = []
-    for vid in val_ids:
-        filled, mask = session_data_and_mask(series_dict[vid][channel_names])
-        val_pairs.append(predict_residuals(multicad, normalize(filled), device, mask=mask,
-                                            chunk_size=config.predict_chunk_size))
+    val_pairs = [predict_residuals(multicad, norm_filled, device, mask=mask,
+                                    chunk_size=config.predict_chunk_size)
+                 for norm_filled, mask in val_prepared]
     val_residuals = np.concatenate([r for r, _ in val_pairs], axis=0)
     val_observed = np.concatenate([o for _, o in val_pairs], axis=0)
     median, std = fit_residual_thresholds(val_residuals, observed=val_observed)
