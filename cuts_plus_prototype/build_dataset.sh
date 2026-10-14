@@ -12,14 +12,22 @@
 # cuts_plus_rca.py's --min-channel-availability, computed from the actual training split.
 #
 # Usage:
-#   cuts_plus_prototype/build_dataset.sh OUTPUT_DIR [REGION] [WL_DIR] [Q_DIR] [RAIN_DIR] [RESAMPLE_FREQ]
+#   cuts_plus_prototype/build_dataset.sh OUTPUT_DIR [REGION] [WL_DIR] [Q_DIR] [RAIN_DIR] [RESAMPLE_FREQ] [START]
 #
 #   OUTPUT_DIR     required - where the final trainable dataset lands (overwritten if it exists)
 #   REGION         'zeeland' | 'limburg' | '' (default '', no region filtering)
 #   WL_DIR         default rws_waterinfo
 #   Q_DIR          default rws_discharge; pass '' to omit discharge
 #   RAIN_DIR       default knmi_rain; pass '' to omit rain
-#   RESAMPLE_FREQ  default 'auto' (prepare_data.py's own coarsest-native-cadence auto-detection)
+#   RESAMPLE_FREQ  default 'auto' (prepare_data.py's own coarsest-native-cadence auto-detection - a
+#                  handful of anomalously coarse-sampled sessions can drag this down badly, see START)
+#   START          default '1974-01-01' (prepare_data.py's --start: drops sessions before this date).
+#                  rws_waterinfo's raw history includes a 1950-1970 era sampled 3-hourly, far coarser
+#                  than the 10-15min cadence everywhere else - left in, --freq auto picks 3h and every
+#                  2-week session then falls below --min-rows, dropping the entire dataset. 1974-01-01
+#                  is this project's own established cutoff (matches the historical
+#                  rws_waterinfo_prepared_1974/rws_waterinfo_limburg/rws_waterinfo_zeeland directories'
+#                  session count exactly - 1330 sessions). Pass '' to disable (keep every session).
 #
 #   Water-level-only: pass '' for both Q_DIR and RAIN_DIR - the merge stage is skipped entirely and
 #   water level is resampled/filtered directly.
@@ -35,6 +43,7 @@ WL_DIR="${3:-rws_waterinfo}"
 Q_DIR="${4-rws_discharge}"
 RAIN_DIR="${5-knmi_rain}"
 RESAMPLE_FREQ="${6:-auto}"
+START="${7-1974-01-01}"
 
 declare -A REGION_BBOX=(
   [zeeland]="51.20 51.78 3.30 4.30"
@@ -81,9 +90,12 @@ if [ -n "$Q_DIR" ] || [ -n "$RAIN_DIR" ]; then
   LOCATIONS_CSV="$STAGE/combined_adapted/locations.csv"
 fi
 
-echo "=== Resampling -> staging (freq=$RESAMPLE_FREQ) ==="
-python3 cuts_plus_prototype/prepare_data.py --input-dir "$PREPARE_INPUT" --output-dir "$STAGE/prepared" \
-  --freq "$RESAMPLE_FREQ"
+echo "=== Resampling -> staging (freq=$RESAMPLE_FREQ, start=${START:-<none>}) ==="
+PREPARE_DATA_ARGS=(--input-dir "$PREPARE_INPUT" --output-dir "$STAGE/prepared" --freq "$RESAMPLE_FREQ")
+if [ -n "$START" ]; then
+  PREPARE_DATA_ARGS+=(--start "$START")
+fi
+python3 cuts_plus_prototype/prepare_data.py "${PREPARE_DATA_ARGS[@]}"
 
 rm -rf "$OUTPUT_DIR"
 if [ -n "$REGION" ]; then

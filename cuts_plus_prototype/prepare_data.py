@@ -156,6 +156,15 @@ def prepare(input_dir: str, output_dir: str, freq: str = 'auto', min_rows: int =
         total_rows += len(regular)
         del regular, values
 
+    if n_kept == 0:
+        raise ValueError(
+            f'Every session had fewer than --min-rows {min_rows} rows on the {freq} grid - nothing '
+            f'written to {output_dir}. This usually means --freq auto picked too coarse a frequency '
+            f'because of a handful of anomalously coarse-sampled sessions early in the data (e.g. a '
+            f'3-hourly era decades before the rest of the history is 10-minute) - pass --start to '
+            f'exclude that era, or pass an explicit --freq instead of auto.'
+        )
+
     count_safe = np.where(count == 0, 1, count)
     mean = np.where(count > 0, sum_ / count_safe, np.nan)
     variance = np.clip(sumsq / count_safe - mean ** 2, 0, None)  # clip: fp cancellation can go ~0-
