@@ -420,16 +420,33 @@ def fit_residual_thresholds(residuals: np.ndarray, observed: np.ndarray = None):
 
 
 def root_cause_analysis(residuals_test, labels_test, median, std, risk, initial_level, num_candidates,
-                         input_step):
+                         input_step, observed=None, min_observed=50, min_std=1e-6):
     """Mirrors aerca.AERCA._testing_root_cause: z-score residuals against validation statistics, fit
-    a per-variable POT threshold, and rank root causes with topk / topk_at_step."""
+    a per-variable POT threshold, and rank root causes with topk / topk_at_step. Per-channel POT
+    fitting uses the same defensive guards as fit_pot_thresholds (too few genuinely-observed points,
+    a near-constant z-score distribution, or pot() itself raising on a low-cardinality/discretized
+    tail - real station data hits these, unlike the synthetic benchmark this was ported from) - a
+    channel that fails any of them gets threshold=NaN instead of crashing the whole run. topk's
+    `np.where(z_scores > threshold, ...)` already treats a NaN threshold as "never above," so that
+    channel is simply excluded from the root-cause ranking rather than aborting it."""
     std_safe = np.where(std == 0, 1e-8, std)
     z_scores = (residuals_test - median) / std_safe
 
-    pot_thresholds = np.array([
-        pot(z_scores[:, i], risk, initial_level, num_candidates)[0]
-        for i in range(z_scores.shape[1])
-    ])
+    pot_thresholds = np.full(z_scores.shape[1], np.nan)
+    skipped_pot_error = []
+    for i in range(z_scores.shape[1]):
+        raw_col = z_scores[observed[:, i] > 0, i] if observed is not None else z_scores[:, i]
+        col = raw_col[np.isfinite(raw_col)]
+        if len(col) < min_observed or np.std(col) < min_std:
+            continue
+        try:
+            pot_thresholds[i] = pot(col, risk, initial_level, num_candidates)[0]
+        except Exception:
+            skipped_pot_error.append(i)
+    if skipped_pot_error:
+        print(f'{len(skipped_pot_error)} channel(s) made pot() raise during root-cause analysis '
+              f'(column index: {skipped_pot_error}) - skipped (threshold=NaN, never flagged) rather '
+              f'than crashing.')
 
     # residuals_test[k] predicts labels_test[k + input_step] (batch_generater's windowing).
     labels_aligned = labels_test[input_step:]
@@ -887,7 +904,7 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
             if labels[config.input_step:].sum() > 0:
                 rc_metrics = root_cause_analysis(residuals, labels, median, std, config.risk,
                                                   config.initial_level, config.num_candidates,
-                                                  config.input_step)
+                                                  config.input_step, observed=observed)
                 print(f'  {sid}: flood root-cause AC@1={rc_metrics["ac@1"]:.3f} '
                       f'AC@5={rc_metrics["ac@5"]:.3f} Avg@10={rc_metrics["avg@10"]:.3f} '
                       f'({int(labels.sum())} labeled (timestep, station) flood exceedance(s))')

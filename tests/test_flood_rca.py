@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 import flood_labels  # noqa: E402
 import mask_flood_events  # noqa: E402
-from cuts_plus_rca import CUTSPlusRCAConfig, run_real_data_pipeline  # noqa: E402
+from cuts_plus_rca import CUTSPlusRCAConfig, root_cause_analysis, run_real_data_pipeline  # noqa: E402
 
 
 def test_load_station_windows_filters_by_alert_and_strips_tz(tmp_path):
@@ -239,3 +239,27 @@ def test_flood_aware_split_pads_score_with_the_most_recent_flood_free_sessions(t
     scored = [i for i in range(10)
                if os.path.exists(os.path.join(model_dir, f'cuts_plus_score_session_{i}_flags.npy'))]
     assert sorted(scored) == [2, 8, 9]  # flood session + the 2 most recent flood-free sessions
+
+
+def test_root_cause_analysis_survives_a_pot_raising_channel():
+    rng = np.random.default_rng(0)
+    n = 2000
+    # channel 0: well-behaved noise, pot() succeeds normally.
+    normal_col = rng.normal(size=n)
+    # channel 1: low-cardinality/discretized tail (mostly 0, a handful of identical spikes) - passes
+    # the length/std guards (std ~0.16, well above min_std) but still makes pot()'s Grimshaw's-trick
+    # step raise, on real station data this crashed the whole training run (see cuts_plus_rca.py's
+    # root_cause_analysis guard, ported from fit_pot_thresholds).
+    degenerate_col = np.zeros(n)
+    degenerate_col[::37] = 1.0
+    residuals = np.stack([normal_col, degenerate_col], axis=1)
+    median = np.zeros(2)
+    std = np.ones(2)
+    labels = np.zeros((n + 1, 2))
+    labels[500, 0] = 1  # one labeled exceedance so topk_at_step has something to rank
+
+    rc_metrics = root_cause_analysis(residuals, labels, median, std, risk=1e-2, initial_level=0.98,
+                                      num_candidates=100, input_step=1)
+
+    for key in ('ac@1', 'ac@10', 'avg@10', 'ac*@1', 'avg*@500'):
+        assert np.isfinite(rc_metrics[key])
