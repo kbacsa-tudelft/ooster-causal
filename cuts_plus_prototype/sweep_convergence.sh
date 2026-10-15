@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Trains 10 named configs on the Limburg dataset to test candidate fixes for the convergence problem
+# Trains 13 named configs on the Limburg dataset to test candidate fixes for the convergence problem
 # found on the real limburg_flood_eval run: graph_discov/data_loss (S2) climbed almost monotonically
 # through training while held_out/val_mse (the genuinely held-out metric) peaked at epoch 10 and never
 # recovered. Mining that run's checkpoint.pt/TensorBoard history pinned down two concrete events:
@@ -14,6 +14,15 @@
 #      smoothly - consistent with the continuous gumbel_tau anneal (sharper discrete sampling) and
 #      lambda_s decay (less sparsity pressure) making the *training* metric mechanically noisier over
 #      time, largely independent of true graph quality.
+#
+# Running no_anneal and the sparsity_* configs below settled the question: no_anneal (lambda_s fixed
+# at 0.3, no anneal at all) crashes just as badly as baseline (peak val_mse 0.99 vs 0.78) - so it's not
+# the anneal itself. sparsity_low (fixed 0.03) and sparsity_mid (fixed 0.1) never crash at all, settling
+# into a flat val_mse ~0.033-0.048 for the whole back half of training; sparsity_high (fixed 1.0)
+# crashes immediately and stays bad. Clean dose-response on lambda_s's absolute magnitude, independent
+# of schedule: too high (>~0.1-0.3) is unstable, <=0.1 fixed is stable. sparsity_fine_* below brackets
+# the still-untested 0.03-0.1 range finely, since sparsity_mid's val_mse drifts up again late (0.033 ->
+# 0.048 after epoch 40) while sparsity_low stays flat - there may be a better/worse point in between.
 #
 # Running the first 6 configs (held_out_eval_every=2) found a third mechanism neither of the above two
 # explains: held_out/val_mse crashes (5-20x) somewhere in epoch 8-20 in every config, including
@@ -68,6 +77,9 @@
 #                         4th point) together sweep fixed sparsity pressure in {0.03, 0.1, 0.3, 1.0},
 #                         all at a fixed (non-annealed) gumbel_tau=1.0 so lambda_s's own effect isn't
 #                         confounded by the tau anneal tested separately by no_anneal itself
+#   sparsity_fine_04/06/08 --end-tau 1.0 --lambda-s-start/-end 0.04/0.06/0.08 (each fixed, no anneal) -
+#                         brackets the stable 0.03-0.1 range sparsity_low/mid identified, at finer
+#                         resolution, to find where (if anywhere) val_mse's late upward drift starts
 #
 # Usage:
 #   cuts_plus_prototype/sweep_convergence.sh [total_epoch] [predict_chunk_size] [held_out_eval_every]
@@ -86,11 +98,12 @@ LAMBDA_S_END=0.03
 
 SWEEP_ROOT=cuts_plus_prototype/scratch/convergence_sweep
 # Built outside SWEEP_ROOT (not a sibling of the config run dirs) so compare_fill_policies.py
-# --sweep-root "$SWEEP_ROOT" only ever sees the 10 config directories, not this dataset build too.
+# --sweep-root "$SWEEP_ROOT" only ever sees the 13 config directories, not this dataset build too.
 DATA_DIR=cuts_plus_prototype/scratch/convergence_dataset_limburg
 
 CONFIGS=(baseline no_coarse_to_fine gentle_anneal delayed_fill_policy combined strict_availability
-          no_anneal sparsity_low sparsity_mid sparsity_high)
+          no_anneal sparsity_low sparsity_mid sparsity_high
+          sparsity_fine_04 sparsity_fine_06 sparsity_fine_08)
 declare -A CONFIG_OVERRIDES=(
   [baseline]=""
   [no_coarse_to_fine]="--n-groups 1000000"
@@ -102,6 +115,9 @@ declare -A CONFIG_OVERRIDES=(
   [sparsity_low]="--end-tau 1.0 --lambda-s-start 0.03 --lambda-s-end 0.03"
   [sparsity_mid]="--end-tau 1.0 --lambda-s-start 0.1 --lambda-s-end 0.1"
   [sparsity_high]="--end-tau 1.0 --lambda-s-start 1.0 --lambda-s-end 1.0"
+  [sparsity_fine_04]="--end-tau 1.0 --lambda-s-start 0.04 --lambda-s-end 0.04"
+  [sparsity_fine_06]="--end-tau 1.0 --lambda-s-start 0.06 --lambda-s-end 0.06"
+  [sparsity_fine_08]="--end-tau 1.0 --lambda-s-start 0.08 --lambda-s-end 0.08"
 )
 
 echo "=== Building Limburg dataset -> $DATA_DIR ==="
