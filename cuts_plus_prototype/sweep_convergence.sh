@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Trains 6 named configs on the Limburg dataset to test candidate fixes for the convergence problem
+# Trains 10 named configs on the Limburg dataset to test candidate fixes for the convergence problem
 # found on the real limburg_flood_eval run: graph_discov/data_loss (S2) climbed almost monotonically
 # through training while held_out/val_mse (the genuinely held-out metric) peaked at epoch 10 and never
 # recovered. Mining that run's checkpoint.pt/TensorBoard history pinned down two concrete events:
@@ -14,6 +14,15 @@
 #      smoothly - consistent with the continuous gumbel_tau anneal (sharper discrete sampling) and
 #      lambda_s decay (less sparsity pressure) making the *training* metric mechanically noisier over
 #      time, largely independent of true graph quality.
+#
+# Running the first 6 configs (held_out_eval_every=2) found a third mechanism neither of the above two
+# explains: held_out/val_mse crashes (5-20x) somewhere in epoch 8-20 in every config, including
+# no_coarse_to_fine (no reset at all) and delayed_fill_policy, which crashes at epoch 14 - a full 6
+# epochs before its own fill_policy=rate_0.1_after_20 onset even starts blending. gentle_anneal (slower
+# gumbel_tau/lambda_s decay) shows the same crash shape merely delayed to epoch 16-18, and ends up
+# *worse* (peak val_mse 1.09 vs baseline's 0.78) rather than avoided. The one thing common to all of
+# them: the continuous gumbel_tau/lambda_s anneal itself, which every config still has running (gentle_
+# anneal only slows it down). no_anneal and the sparsity_* configs below test that directly.
 #
 # All 4 candidate interventions below are reachable via existing CLI flags - no vendor/cuts_plus.py
 # training-loop changes needed to test them (a real fix - preserving Adam momentum across a group-
@@ -43,6 +52,22 @@
 #                         20 channels at 54% missing - confirmed by sweeping --min-channel-availability
 #                         from 0.0 to 0.7 against this dataset's actual train split), the least
 #                         aggressive point before the missing-fraction curve flattens out further
+#   no_anneal              --end-tau 1.0 --lambda-s-end 0.3 - --start-tau defaults to 1.0 (unchanged)
+#                         and --lambda-s-start is still the sweep's own common $LAMBDA_S_START=0.3
+#                         (below) - matching each end to its start makes gamma=1 for both schedules:
+#                         gumbel_tau and lambda_s stay constant at 1.0 and 0.3 for the whole run instead
+#                         of annealing - tests whether the epoch 8-20 crash is caused by the anneal
+#                         itself rather than by any value it passes through
+#   sparsity_low           --end-tau 1.0 --lambda-s-start 0.03 --lambda-s-end 0.03 - fixed (no anneal)
+#                         sparsity pressure at the current schedule's *end* value
+#   sparsity_mid           --end-tau 1.0 --lambda-s-start 0.1 --lambda-s-end 0.1 - fixed sparsity
+#                         pressure midway between sparsity_low and no_anneal's constant 0.3
+#   sparsity_high          --end-tau 1.0 --lambda-s-start 1.0 --lambda-s-end 1.0 - fixed sparsity
+#                         pressure above the current schedule's *start* value
+#                         sparsity_low/mid/high and no_anneal (its constant lambda_s=0.3 doubles as the
+#                         4th point) together sweep fixed sparsity pressure in {0.03, 0.1, 0.3, 1.0},
+#                         all at a fixed (non-annealed) gumbel_tau=1.0 so lambda_s's own effect isn't
+#                         confounded by the tau anneal tested separately by no_anneal itself
 #
 # Usage:
 #   cuts_plus_prototype/sweep_convergence.sh [total_epoch] [predict_chunk_size] [held_out_eval_every]
@@ -61,10 +86,11 @@ LAMBDA_S_END=0.03
 
 SWEEP_ROOT=cuts_plus_prototype/scratch/convergence_sweep
 # Built outside SWEEP_ROOT (not a sibling of the config run dirs) so compare_fill_policies.py
-# --sweep-root "$SWEEP_ROOT" only ever sees the 6 config directories, not this dataset build too.
+# --sweep-root "$SWEEP_ROOT" only ever sees the 10 config directories, not this dataset build too.
 DATA_DIR=cuts_plus_prototype/scratch/convergence_dataset_limburg
 
-CONFIGS=(baseline no_coarse_to_fine gentle_anneal delayed_fill_policy combined strict_availability)
+CONFIGS=(baseline no_coarse_to_fine gentle_anneal delayed_fill_policy combined strict_availability
+          no_anneal sparsity_low sparsity_mid sparsity_high)
 declare -A CONFIG_OVERRIDES=(
   [baseline]=""
   [no_coarse_to_fine]="--n-groups 1000000"
@@ -72,6 +98,10 @@ declare -A CONFIG_OVERRIDES=(
   [delayed_fill_policy]="--fill-policy rate_0.1_after_20"
   [combined]="--n-groups 1000000 --end-tau 0.3 --lambda-s-end 0.1 --fill-policy rate_0.1_after_20"
   [strict_availability]="--min-channel-availability 0.15"
+  [no_anneal]="--end-tau 1.0 --lambda-s-end 0.3"
+  [sparsity_low]="--end-tau 1.0 --lambda-s-start 0.03 --lambda-s-end 0.03"
+  [sparsity_mid]="--end-tau 1.0 --lambda-s-start 0.1 --lambda-s-end 0.1"
+  [sparsity_high]="--end-tau 1.0 --lambda-s-start 1.0 --lambda-s-end 1.0"
 )
 
 echo "=== Building Limburg dataset -> $DATA_DIR ==="
