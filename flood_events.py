@@ -289,19 +289,36 @@ def station_events(st: Station, s: pd.Series, river_periods: list[float]) -> pd.
     return ev
 
 
-def merge_national(ev: pd.DataFrame) -> pd.DataFrame:
-    """Merge station events of the same kind whose peaks are close in time."""
+def merge_national(ev: pd.DataFrame, group_col: str = "kind", gap_days: int = None) -> pd.DataFrame:
+    """Merge station events in the same group whose peaks are close in time.
+
+    Grouping by "kind" (the only call site until flood_events_municipality.py) merges same-kind
+    (coast/river) station events nationally, with gap_days=None falling back to the existing per-kind
+    MERGE_DAYS lookup - this is the original, byte-for-byte unchanged behavior (verified by diffing
+    events.csv/station_events.csv before/after this signature change).
+
+    flood_events_municipality.py instead calls this with group_col="municipality_code" and an explicit
+    flat gap_days, to merge same-municipality station events into municipality-scoped events instead of
+    national ones - a municipality can mix coastal and river stations (e.g. Rotterdam), so there's no
+    single "kind" to look up a per-kind gap for."""
     rows = []
-    for kind, grp in ev.groupby("kind"):
+    for key, grp in ev.groupby(group_col):
         grp = grp.sort_values("peak_time")
-        gap = grp["peak_time"].diff() > pd.Timedelta(days=MERGE_DAYS[kind])
+        gap_d = gap_days if gap_days is not None else MERGE_DAYS[key]
+        gap = grp["peak_time"].diff() > pd.Timedelta(days=gap_d)
         for _, g in grp.groupby(gap.cumsum().values):
             top = g.loc[g["alert"].map(CLASS_ORDER).idxmax()]
-            rows.append({
+            row = {
                 "start": g["start"].min().date(),
                 "end": g["end"].max().date(),
                 "peak_date": top["peak_time"].date(),
-                "type": "storm surge" if kind == "coast" else "river high water",
+            }
+            # Same key position ("type", right after peak_date) as the original function wrote it,
+            # for the group_col="kind" call site - verified byte-for-byte unchanged by diffing
+            # events.csv/station_events.csv before/after this signature change.
+            row["type" if group_col == "kind" else group_col] = (
+                ("storm surge" if key == "coast" else "river high water") if group_col == "kind" else key)
+            row.update({
                 "alert": top["alert"],
                 "worst_station": top["station"],
                 "worst_detail": top["detail"],
@@ -310,6 +327,7 @@ def merge_national(ev: pd.DataFrame) -> pd.DataFrame:
                     f"{r.station} {round(r.peak_level)} ({r.alert})"
                     for r in g.sort_values("peak_level", ascending=False).itertuples()),
             })
+            rows.append(row)
     out = pd.DataFrame(rows)
     if out.empty:
         return out

@@ -20,9 +20,15 @@ long-term reference geography, not a per-run generated artifact, and committing 
 network dependency for every future flood-geometry run. Rerun this script only if NLGis's data updates
 or the set of ROR source events changes.
 
+--source pdok fetches today's current-day boundaries from PDOK/Kadaster instead (CC BY 4.0, no auth) -
+NLGis's own coverage stops at 2020. Combined with --national (skip the ROR/station trim entirely and
+keep every municipality nationwide), this is what flood_events_municipality.py needs to join stations
+scattered anywhere in the country, not just near the 6 historical flood events used for the map.
+
 Usage:
     python3 fetch_municipalities.py --year 1820 --out reference_data/municipalities_1820.geojson
     python3 fetch_municipalities.py --year 1953 --out reference_data/municipalities_1953.geojson
+    python3 fetch_municipalities.py --source pdok --national
 """
 import argparse
 import json
@@ -41,9 +47,18 @@ from flood_events import DEFAULT_STATIONS
 NLGIS_DATASET_API = "https://dataverse.nl/api/datasets/:persistentId/?persistentId=doi:10.34894/4G2NJM"
 NLGIS_FILE_ACCESS = "https://dataverse.nl/api/access/datafile/{file_id}"
 # NLGis properties are naam/acode/cbscode/year - renamed to "code"/"naam" on output so every downstream
-# consumer (flood_geometry.py) can read either a NLGis-year file or (previously) a PDOK file the same
-# way, without caring which source or year it came from.
-KEEP_PROPERTIES = {"cbscode": "code", "naam": "naam"}
+# consumer (flood_geometry.py) can read either a NLGis-year file or a PDOK file the same way, without
+# caring which source or year it came from.
+NLGIS_KEEP_PROPERTIES = {"cbscode": "code", "naam": "naam"}
+
+# PDOK/Kadaster's current-day municipality API (CC BY 4.0, no auth) - used for --source pdok instead
+# of a historical NLGis year, since NLGis's own coverage stops at 2020 and station-municipality
+# assignment for flood_events_municipality.py wants today's boundaries, not a historical snapshot.
+PDOK_ITEMS_URL = (
+    "https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1/collections/gemeentegebied/items"
+    "?f=json&limit=1000"
+)
+PDOK_KEEP_PROPERTIES = {"code": "code", "naam": "naam"}
 
 # Only the 6 "Hoofdwatersysteem" ROR events (nr 1-6) are ever used downstream (flood_geometry.py's
 # STORM_SURGE_CANDIDATES/RIVER_CANDIDATES) - the 4 "Regionaal watersysteem" ones (nr 7-10, canal/peat-
@@ -84,6 +99,23 @@ def fetch_year(year: int) -> list:
     return data["features"]
 
 
+def fetch_pdok(start_url: str = PDOK_ITEMS_URL) -> list:
+    """Follows the OGC API's own 'next' pagination link until exhausted (confirmed in practice to
+    return all ~342 municipalities in one page at limit=1000, but paginate defensively in case a
+    future server-side limit is lower)."""
+    features = []
+    url = start_url
+    for _ in range(50):  # safety cap, well above any plausible page count
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = json.load(resp)
+        features.extend(data["features"])
+        links = {link["rel"]: link["href"] for link in data.get("links", [])}
+        if "next" not in links:
+            break
+        url = links["next"]
+    return features
+
+
 def build_search_region(ror_events_geojson: str, locations_csv: str, buffer_km: float):
     with open(ror_events_geojson) as f:
         collection = json.load(f)
@@ -112,34 +144,57 @@ def build_search_region(ror_events_geojson: str, locations_csv: str, buffer_km: 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--year", type=int, required=True,
-                         help="which NLGis yearly boundary file to fetch (1812-2020)")
+    parser.add_argument("--source", choices=["nlgis", "pdok"], default="nlgis",
+                         help="'nlgis': a historical year (1812-2020, see --year). 'pdok': today's "
+                              "current-day municipality boundaries (no --year).")
+    parser.add_argument("--year", type=int, default=None,
+                         help="which NLGis yearly boundary file to fetch (1812-2020) - required for "
+                              "--source nlgis, ignored for --source pdok")
+    parser.add_argument("--national", action="store_true",
+                         help="keep every municipality nationwide instead of trimming to the "
+                              "6 candidate ROR events + 11 gauge stations (see build_search_region) - "
+                              "needed when stations can be anywhere in the country, e.g. for "
+                              "flood_events_municipality.py's station-to-municipality join")
     parser.add_argument("--ror-events-geojson", default="flood_events_output/ror_historical_events.geojson")
     parser.add_argument("--out", default=None,
-                         help="default: reference_data/municipalities_<year>.geojson")
+                         help="default: reference_data/municipalities_<year>.geojson, or "
+                              "reference_data/municipalities_2024_national.geojson for "
+                              "--source pdok --national")
     parser.add_argument("--buffer-km", type=float, default=20.0,
                          help="how far beyond the 6 candidate ROR events' real extents and the 11 "
-                              "gauge stations' own locations to also keep neighboring municipalities")
+                              "gauge stations' own locations to also keep neighboring municipalities "
+                              "(ignored with --national)")
     parser.add_argument("--locations-csv", default="rws_waterinfo/locations.csv")
     parser.add_argument("--simplify-deg", type=float, default=0.0005,
                          help="shapely simplify() tolerance in degrees (~50m), to keep the committed "
                               "file a reasonable size")
     args = parser.parse_args()
-    out = args.out or f"reference_data/municipalities_{args.year}.geojson"
+    if args.source == "nlgis" and args.year is None:
+        parser.error("--year is required for --source nlgis")
 
-    print(f"Fetching NLGis {args.year} municipality boundaries ...")
-    raw_features = fetch_year(args.year)
-    print(f"Fetched {len(raw_features)} municipalities nationwide for {args.year}")
+    if args.source == "nlgis":
+        out = args.out or f"reference_data/municipalities_{args.year}.geojson"
+        print(f"Fetching NLGis {args.year} municipality boundaries ...")
+        raw_features = fetch_year(args.year)
+        keep_properties = NLGIS_KEEP_PROPERTIES
+        print(f"Fetched {len(raw_features)} municipalities nationwide for {args.year}")
+    else:
+        out = args.out or "reference_data/municipalities_2024_national.geojson"
+        print("Fetching PDOK current-day municipality boundaries ...")
+        raw_features = fetch_pdok()
+        keep_properties = PDOK_KEEP_PROPERTIES
+        print(f"Fetched {len(raw_features)} municipalities nationwide")
 
-    search_region = build_search_region(args.ror_events_geojson, args.locations_csv, args.buffer_km)
+    search_region = None if args.national else build_search_region(
+        args.ror_events_geojson, args.locations_csv, args.buffer_km)
 
     kept = []
     for feature in raw_features:
         geom = shape(feature["geometry"])
-        if geom.intersects(search_region):
+        if search_region is None or geom.intersects(search_region):
             simplified = geom.simplify(args.simplify_deg, preserve_topology=True)
             props = {out_key: feature["properties"].get(in_key)
-                     for in_key, out_key in KEEP_PROPERTIES.items()}
+                     for in_key, out_key in keep_properties.items()}
             kept.append({"type": "Feature", "properties": props,
                          "geometry": mapping(simplified)})
 
@@ -150,8 +205,11 @@ def main():
     with open(out, "w", encoding="utf-8") as f:
         json.dump(collection, f, indent=2)
 
-    print(f"Kept {len(kept)}/{len(raw_features)} municipalities within {args.buffer_km}km of the 6 "
-          f"candidate ROR events' real extents or the 11 gauge stations -> {out}")
+    if args.national:
+        print(f"Kept all {len(kept)}/{len(raw_features)} municipalities nationwide -> {out}")
+    else:
+        print(f"Kept {len(kept)}/{len(raw_features)} municipalities within {args.buffer_km}km of the "
+              f"6 candidate ROR events' real extents or the 11 gauge stations -> {out}")
 
 
 if __name__ == "__main__":
