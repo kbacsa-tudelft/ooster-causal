@@ -196,12 +196,14 @@ def synthesize_extent(profile: dict, event_type: str, anchor_lonlat: tuple, frac
     return union_wgs84, affected
 
 
-def nearest_municipality(anchor_lonlat: tuple, municipalities: list) -> dict:
-    """The single municipality containing, or otherwise nearest, anchor_lonlat - "the first
-    municipality affected" by an event anchored there. Returns the raw GeoJSON feature (not just its
-    geometry), so callers can also read its code/naam."""
+def nearest_municipalities(anchor_lonlat: tuple, municipalities: list, n: int = 1) -> list:
+    """The `n` municipalities containing, or otherwise nearest, anchor_lonlat, nearest first - "the
+    top-n municipalities affected" by an event anchored there. Returns the raw GeoJSON features (not
+    just their geometry), so callers can also read their code/naam."""
     anchor_rd = _reproject(Point(anchor_lonlat), TO_RD)
-    return min(municipalities, key=lambda f: _reproject(shape(f["geometry"]), TO_RD).distance(anchor_rd))
+    ranked = sorted(municipalities,
+                     key=lambda f: _reproject(shape(f["geometry"]), TO_RD).distance(anchor_rd))
+    return ranked[:n]
 
 
 def weighted_centroid_lonlat(station_weights: dict, locations) -> tuple:

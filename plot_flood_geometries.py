@@ -11,19 +11,19 @@ Events are grouped into one toggleable layer per decade (via folium's native Lay
 of the map) - all decades are shown by default, un-check any to filter them out interactively without
 regenerating the map.
 
-Default --geometry is "first_municipality": the single municipality (from --municipalities, default
-the 1820 map) nearest the *weighted centroid* of every station that crossed its own threshold for that
-event - not just the event's single worst_station. events.csv only keeps the one worst-performing
-gauge per national event, but station_events.csv still has every individual station involved (47% of
-events - 126/267 - actually involve 2-6 distinct stations at once). E.g. the 1953 storm surge's
-Vlissingen 453 (high), Hoek van Holland 381 (high), Dordrecht 370 (high), Harlingen 365 (medium), Den
-Helder 322 (medium) are combined via flood_geometry.weighted_centroid_lonlat() into one point pulled
-toward Vlissingen (the highest weight) without discarding the other four, then resolved to that
-point's own nearest municipality. A single-station event (the other 53%) still resolves to exactly its
-own station's municipality, since a weighted centroid of one point is just that point. --geometry
-extent plots the full synthesized municipality-union instead (much more overlap, since it's
-severity-scaled and can span dozens of municipalities); --geometry point plots a marker sized by
-severity instead of any shape at all.
+Default --geometry is "first_municipality": the --top-n-municipalities (default 5) municipalities
+(from --municipalities, default the 1820 map) nearest the *weighted centroid* of every station that
+crossed its own threshold for that event - not just the event's single worst_station. events.csv only
+keeps the one worst-performing gauge per national event, but station_events.csv still has every
+individual station involved (47% of events - 126/267 - actually involve 2-6 distinct stations at
+once). E.g. the 1953 storm surge's Vlissingen 453 (high), Hoek van Holland 381 (high), Dordrecht 370
+(high), Harlingen 365 (medium), Den Helder 322 (medium) are combined via
+flood_geometry.weighted_centroid_lonlat() into one point pulled toward Vlissingen (the highest weight)
+without discarding the other four, then flood_geometry.nearest_municipalities() takes the 5 closest
+municipalities to that point (not just the 1 containing it) and unions them - a small cluster around
+the weighted centroid rather than a single sliver. --geometry extent plots the full synthesized
+municipality-union instead (much more overlap, since it's severity-scaled and can span dozens of
+municipalities); --geometry point plots a marker sized by severity instead of any shape at all.
 
 Usage:
     python3 plot_flood_geometries.py --geojson flood_events_output/flood_events.geojson \
@@ -35,6 +35,7 @@ import json
 import folium
 import pandas as pd
 from shapely.geometry import mapping, shape
+from shapely.ops import unary_union
 
 import flood_geometry as fg
 from flood_events import DEFAULT_STATIONS
@@ -135,12 +136,15 @@ def main():
                          help="which property to color polygon fills by")
     parser.add_argument("--geometry", choices=["first_municipality", "extent", "point"],
                          default="first_municipality",
-                         help="'first_municipality': just the single municipality at each event's "
-                              "anchor station - a real shape, minimal overlap. 'extent': the full "
+                         help="'first_municipality': the --top-n-municipalities nearest each event's "
+                              "weighted anchor - a real shape, minimal overlap. 'extent': the full "
                               "severity-scaled synthesized union (much more overlap). 'point': a "
                               "marker sized by severity, no shape at all.")
     parser.add_argument("--municipalities", default="reference_data/municipalities_1820.geojson",
                          help="municipality set --geometry first_municipality picks from")
+    parser.add_argument("--top-n-municipalities", type=int, default=5,
+                         help="how many of the nearest municipalities to the weighted anchor to show "
+                              "per event, for --geometry first_municipality")
     parser.add_argument("--station-events-csv", default="flood_events_output/station_events.csv",
                          help="used by --geometry first_municipality to find every station "
                               "contributing to an event, not just its single worst_station")
@@ -199,11 +203,16 @@ def main():
                 cache_key = tuple(sorted(weights.items()))
                 if cache_key not in municipality_cache:
                     centroid_lonlat = fg.weighted_centroid_lonlat(weights, locations)
-                    municipality_cache[cache_key] = fg.nearest_municipality(centroid_lonlat, municipalities)
-                municipality = municipality_cache[cache_key]
+                    top_n = fg.nearest_municipalities(centroid_lonlat, municipalities,
+                                                       n=args.top_n_municipalities)
+                    geometry = top_n[0]["geometry"] if len(top_n) == 1 else mapping(
+                        unary_union([shape(m["geometry"]) for m in top_n]))
+                    names = [m["properties"]["naam"] for m in top_n]
+                    municipality_cache[cache_key] = (geometry, names)
+                geometry, names = municipality_cache[cache_key]
                 render_feature = {"type": "Feature", "properties": dict(feature["properties"]),
-                                   "geometry": municipality["geometry"]}
-                render_feature["properties"]["first_municipality"] = municipality["properties"]["naam"]
+                                   "geometry": geometry}
+                render_feature["properties"]["first_municipality"] = ";".join(names)
                 render_feature["properties"]["n_contributing_stations"] = len(weights)
             else:
                 render_feature = feature
