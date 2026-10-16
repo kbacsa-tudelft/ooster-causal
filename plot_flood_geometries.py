@@ -7,6 +7,10 @@ stroke style is keyed by extent_source (solid = digitized, a real ROR polygon; d
 derived_municipalities, a synthesized union of real municipality polygons) so approximations are
 visually distinguishable from the real thing.
 
+Events are grouped into one toggleable layer per decade (via folium's native LayerControl, top right
+of the map) - all decades are shown by default, un-check any to filter them out interactively without
+regenerating the map.
+
 Usage:
     python3 plot_flood_geometries.py --geojson flood_events_output/flood_events.geojson \
         --output flood_events_output/flood_map.html
@@ -29,6 +33,11 @@ TILES_ATTR = "Esri, HERE, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors
 
 TOOLTIP_FIELDS = ["peak_date", "type", "alert", "worst_station", "extent_source", "matched_nr",
                    "severity_fraction", "affected_municipalities"]
+
+
+def decade_label(peak_date: str) -> str:
+    year = int(peak_date[:4])
+    return f"{(year // 10) * 10}s"
 
 
 def make_style_function(color_by: str):
@@ -96,7 +105,11 @@ def main():
     m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles=TILES_URL, attr=TILES_ATTR)
 
     style_function = make_style_function(args.color_by)
+    decade_groups = {}
     for feature in features:
+        decade = decade_label(feature["properties"]["peak_date"])
+        group = decade_groups.setdefault(decade, folium.FeatureGroup(name=decade, show=True))
+
         simplified = dict(feature)
         simplified["geometry"] = mapping(shape(feature["geometry"]).simplify(
             args.simplify_deg, preserve_topology=True))
@@ -105,7 +118,10 @@ def main():
             style_function=style_function,
             tooltip=folium.GeoJsonTooltip(fields=[f for f in TOOLTIP_FIELDS
                                                    if f in feature["properties"]]),
-        ).add_to(m)
+        ).add_to(group)
+    for decade in sorted(decade_groups):
+        decade_groups[decade].add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
     m.get_root().html.add_child(folium.Element(legend_html(args.color_by)))
 
     # Overlay the 11 gauge stations for grounding.
