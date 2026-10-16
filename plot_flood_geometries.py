@@ -12,7 +12,7 @@ of the map) - all decades are shown by default, un-check any to filter them out 
 regenerating the map.
 
 Default --geometry is "first_municipality": the --top-n-municipalities (default 5) municipalities
-(from --municipalities, default the 1820 map) nearest the *weighted centroid* of every station that
+(from --municipalities, default the current 2024 map) nearest the *weighted centroid* of every station that
 crossed its own threshold for that event - not just the event's single worst_station. events.csv only
 keeps the one worst-performing gauge per national event, but station_events.csv still has every
 individual station involved (47% of events - 126/267 - actually involve 2-6 distinct stations at
@@ -52,7 +52,7 @@ TOOLTIP_FIELDS = ["peak_date", "type", "alert", "worst_station", "extent_source"
 # Long municipality lists (first_municipality/affected_municipalities) otherwise render as one
 # unbroken line that runs off the visible tooltip - force wrapping and cap the width so it reads as
 # a readable block instead.
-TOOLTIP_STYLE = "white-space: normal; word-wrap: break-word; max-width: 280px;"
+TOOLTIP_STYLE = "white-space: normal; word-wrap: break-word; max-width: 420px; font-size: 13px;"
 
 
 def decade_label(peak_date: str) -> str:
@@ -144,7 +144,7 @@ def main():
                               "weighted anchor - a real shape, minimal overlap. 'extent': the full "
                               "severity-scaled synthesized union (much more overlap). 'point': a "
                               "marker sized by severity, no shape at all.")
-    parser.add_argument("--municipalities", default="reference_data/municipalities_1820.geojson",
+    parser.add_argument("--municipalities", default="reference_data/municipalities_2024.geojson",
                          help="municipality set --geometry first_municipality picks from")
     parser.add_argument("--top-n-municipalities", type=int, default=5,
                          help="how many of the nearest municipalities to the weighted anchor to show "
