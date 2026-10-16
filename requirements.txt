@@ -79,3 +79,4 @@ plotly
 folium
 pyproj
 pyarrow
+shapely
