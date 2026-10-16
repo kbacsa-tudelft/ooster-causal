@@ -11,6 +11,13 @@ Events are grouped into one toggleable layer per decade (via folium's native Lay
 of the map) - all decades are shown by default, un-check any to filter them out interactively without
 regenerating the map.
 
+Default --geometry is "point": plotting all 267 derived_municipalities extents at once produces so
+much polygon overlap (many events share the same nearest-template reach profile) that the map becomes
+unreadable - a marker at each event's own anchor gauge station, sized by severity_fraction, is far
+clearer for seeing "when/where/how severe" at a glance. --geometry extent keeps the original full
+synthesized-polygon rendering, better suited to inspecting one or a few events closely (e.g. with
+--only-alert high) than the whole catalog at once.
+
 Usage:
     python3 plot_flood_geometries.py --geojson flood_events_output/flood_events.geojson \
         --output flood_events_output/flood_map.html
@@ -22,6 +29,7 @@ import folium
 import pandas as pd
 from shapely.geometry import mapping, shape
 
+import flood_geometry as fg
 from flood_events import DEFAULT_STATIONS
 
 COLOR_PALETTES = {
@@ -55,6 +63,26 @@ def make_style_function(color_by: str):
     return style_function
 
 
+MIN_RADIUS, MAX_RADIUS = 5, 20
+
+
+def anchor_marker(feature: dict, locations, name_to_code: dict, color_by: str) -> folium.CircleMarker:
+    props = feature["properties"]
+    code = name_to_code[props["worst_station"]]
+    lon, lat = fg.station_lonlat(code, locations)
+    radius = MIN_RADIUS + (MAX_RADIUS - MIN_RADIUS) * props["severity_fraction"]
+    palette = COLOR_PALETTES[color_by]
+    tooltip_rows = "".join(f"<b>{field}</b>: {props[field]}<br>" for field in TOOLTIP_FIELDS
+                            if field in props)
+    return folium.CircleMarker(
+        location=[lat, lon], radius=radius,
+        color="#2c3e50", weight=1 if props.get("extent_source") == "digitized" else 0.5,
+        dash_array=None if props.get("extent_source") == "digitized" else "4,3",
+        fill=True, fill_color=palette.get(props.get(color_by), "#95a5a6"), fill_opacity=0.6,
+        tooltip=folium.Tooltip(tooltip_rows),
+    )
+
+
 def legend_html(color_by: str) -> str:
     rows = "".join(
         f'<div><span style="background:{color};width:12px;height:12px;display:inline-block;'
@@ -75,6 +103,9 @@ def main():
     parser.add_argument("--output", default="flood_events_output/flood_map.html")
     parser.add_argument("--color-by", choices=["alert", "type"], default="alert",
                          help="which property to color polygon fills by")
+    parser.add_argument("--geometry", choices=["point", "extent"], default="point",
+                         help="'point': a marker at each event's anchor station, sized by severity - "
+                              "much less visual overlap. 'extent': the full synthesized polygon.")
     parser.add_argument("--only-alert", choices=["low", "medium", "high"],
                          help="only plot events at this alert level")
     parser.add_argument("--only-source", choices=["digitized", "derived_municipalities"],
@@ -105,20 +136,24 @@ def main():
     m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles=TILES_URL, attr=TILES_ATTR)
 
     style_function = make_style_function(args.color_by)
+    name_to_code = fg.station_name_to_code()
     decade_groups = {}
     for feature in features:
         decade = decade_label(feature["properties"]["peak_date"])
         group = decade_groups.setdefault(decade, folium.FeatureGroup(name=decade, show=True))
 
-        simplified = dict(feature)
-        simplified["geometry"] = mapping(shape(feature["geometry"]).simplify(
-            args.simplify_deg, preserve_topology=True))
-        folium.GeoJson(
-            simplified,
-            style_function=style_function,
-            tooltip=folium.GeoJsonTooltip(fields=[f for f in TOOLTIP_FIELDS
-                                                   if f in feature["properties"]]),
-        ).add_to(group)
+        if args.geometry == "point":
+            anchor_marker(feature, locations, name_to_code, args.color_by).add_to(group)
+        else:
+            simplified = dict(feature)
+            simplified["geometry"] = mapping(shape(feature["geometry"]).simplify(
+                args.simplify_deg, preserve_topology=True))
+            folium.GeoJson(
+                simplified,
+                style_function=style_function,
+                tooltip=folium.GeoJsonTooltip(fields=[f for f in TOOLTIP_FIELDS
+                                                       if f in feature["properties"]]),
+            ).add_to(group)
     for decade in sorted(decade_groups):
         decade_groups[decade].add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
