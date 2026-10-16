@@ -194,3 +194,11 @@ def synthesize_extent(profile: dict, event_type: str, anchor_lonlat: tuple, frac
     union_wgs84 = _reproject(union_rd, TO_WGS84)
     affected = [{"code": f["properties"]["code"], "naam": f["properties"]["naam"]} for f in selected]
     return union_wgs84, affected
+
+
+def nearest_municipality(anchor_lonlat: tuple, municipalities: list) -> dict:
+    """The single municipality containing, or otherwise nearest, anchor_lonlat - "the first
+    municipality affected" by an event anchored there. Returns the raw GeoJSON feature (not just its
+    geometry), so callers can also read its code/naam."""
+    anchor_rd = _reproject(Point(anchor_lonlat), TO_RD)
+    return min(municipalities, key=lambda f: _reproject(shape(f["geometry"]), TO_RD).distance(anchor_rd))

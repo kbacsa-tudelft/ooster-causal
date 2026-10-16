@@ -11,15 +11,15 @@ Events are grouped into one toggleable layer per decade (via folium's native Lay
 of the map) - all decades are shown by default, un-check any to filter them out interactively without
 regenerating the map.
 
-Default --geometry is "extent": the real synthesized municipality-union shapes. Every one of the 267
-events is anchored at one of only 11 gauge stations (flood_events.py's events.csv only ever tags a
-national event with its single worst_station) - so many events' extents genuinely do overlap heavily
-around the same handful of locations; that's a property of the underlying data, not a rendering
-artifact, and no amount of styling fully undoes it. Low fillOpacity/thin strokes here keep overlapping
-shapes legible (stacked events build up darker rather than one occluding the rest) without losing the
-actual municipality shapes. --geometry point (a marker at each event's anchor station, sized by
-severity_fraction) is still available for a quick decluttered "when/how severe" overview, at the cost
-of showing a dot instead of a shape.
+Default --geometry is "first_municipality": just the single municipality (from --municipalities,
+default the 1820 map) containing or nearest each event's own anchor gauge station - a real shape, but
+a small, mostly non-overlapping one, since every one of the 267 events is anchored at one of only 11
+gauge stations (flood_events.py's events.csv only ever tags a national event with its single
+worst_station) and "first affected" is the same question regardless of severity. Events sharing an
+anchor do still draw the exact same municipality shape on top of each other - that's inherent to only
+having 11 possible anchors, not fixable by styling. --geometry extent plots the full synthesized
+municipality-union instead (much more overlap, since it's severity-scaled and can span dozens of
+municipalities); --geometry point plots a marker sized by severity instead of any shape at all.
 
 Usage:
     python3 plot_flood_geometries.py --geojson flood_events_output/flood_events.geojson \
@@ -109,10 +109,14 @@ def main():
     parser.add_argument("--output", default="flood_events_output/flood_map.html")
     parser.add_argument("--color-by", choices=["alert", "type"], default="alert",
                          help="which property to color polygon fills by")
-    parser.add_argument("--geometry", choices=["point", "extent"], default="extent",
-                         help="'extent': the real synthesized municipality-union shape. 'point': a "
-                              "marker at each event's anchor station, sized by severity - a quick "
-                              "decluttered overview, but loses the actual shape.")
+    parser.add_argument("--geometry", choices=["first_municipality", "extent", "point"],
+                         default="first_municipality",
+                         help="'first_municipality': just the single municipality at each event's "
+                              "anchor station - a real shape, minimal overlap. 'extent': the full "
+                              "severity-scaled synthesized union (much more overlap). 'point': a "
+                              "marker sized by severity, no shape at all.")
+    parser.add_argument("--municipalities", default="reference_data/municipalities_1820.geojson",
+                         help="municipality set --geometry first_municipality picks from")
     parser.add_argument("--only-alert", choices=["low", "medium", "high"],
                          help="only plot events at this alert level")
     parser.add_argument("--only-source", choices=["digitized", "derived_municipalities"],
@@ -144,6 +148,13 @@ def main():
 
     style_function = make_style_function(args.color_by)
     name_to_code = fg.station_name_to_code()
+    if args.geometry == "first_municipality":
+        with open(args.municipalities) as f:
+            municipalities = json.load(f)["features"]
+        # Repeated anchors (many events share a station) always pick the same municipality - cache it
+        # rather than re-scanning the whole municipality list for every one of the 267 events.
+        municipality_cache = {}
+
     decade_groups = {}
     for feature in features:
         decade = decade_label(feature["properties"]["peak_date"])
@@ -152,14 +163,26 @@ def main():
         if args.geometry == "point":
             anchor_marker(feature, locations, name_to_code, args.color_by).add_to(group)
         else:
-            simplified = dict(feature)
-            simplified["geometry"] = mapping(shape(feature["geometry"]).simplify(
+            if args.geometry == "first_municipality":
+                anchor_code = name_to_code[feature["properties"]["worst_station"]]
+                if anchor_code not in municipality_cache:
+                    anchor_lonlat = fg.station_lonlat(anchor_code, locations)
+                    municipality_cache[anchor_code] = fg.nearest_municipality(anchor_lonlat, municipalities)
+                municipality = municipality_cache[anchor_code]
+                render_feature = {"type": "Feature", "properties": dict(feature["properties"]),
+                                   "geometry": municipality["geometry"]}
+                render_feature["properties"]["first_municipality"] = municipality["properties"]["naam"]
+            else:
+                render_feature = feature
+
+            simplified = dict(render_feature)
+            simplified["geometry"] = mapping(shape(render_feature["geometry"]).simplify(
                 args.simplify_deg, preserve_topology=True))
             folium.GeoJson(
                 simplified,
                 style_function=style_function,
-                tooltip=folium.GeoJsonTooltip(fields=[f for f in TOOLTIP_FIELDS
-                                                       if f in feature["properties"]]),
+                tooltip=folium.GeoJsonTooltip(fields=[f for f in TOOLTIP_FIELDS + ["first_municipality"]
+                                                       if f in simplified["properties"]]),
             ).add_to(group)
     for decade in sorted(decade_groups):
         decade_groups[decade].add_to(m)
