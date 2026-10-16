@@ -48,10 +48,12 @@ TILES_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_M
 TILES_ATTR = "Esri, HERE, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors, and the GIS User Community"
 
 TOOLTIP_FIELDS = ["peak_date", "type", "alert", "worst_station", "extent_source", "matched_nr",
-                   "severity_fraction", "affected_municipalities"]
-# Long municipality lists (first_municipality/affected_municipalities) otherwise render as one
-# unbroken line that runs off the visible tooltip - force wrapping and cap the width so it reads as
-# a readable block instead.
+                   "severity_fraction"]
+# affected_municipalities (events.csv's own severity-scaled union, can be dozens of names for a
+# derived_municipalities row) is deliberately excluded - takes up far too much tooltip space and
+# isn't what --geometry first_municipality even shows; first_municipality (added separately below,
+# already capped at --top-n-municipalities) is the relevant municipality list to display instead.
+# Long text still wraps rather than running off the tooltip, in case any remaining field is long.
 TOOLTIP_STYLE = "white-space: normal; word-wrap: break-word; max-width: 420px; font-size: 13px;"
 
 
