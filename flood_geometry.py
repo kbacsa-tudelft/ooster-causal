@@ -204,19 +204,18 @@ def nearest_municipality(anchor_lonlat: tuple, municipalities: list) -> dict:
     return min(municipalities, key=lambda f: _reproject(shape(f["geometry"]), TO_RD).distance(anchor_rd))
 
 
-def combined_first_municipalities(station_weights: dict, locations, municipalities: list) -> list:
-    """The combination of each contributing station's own nearest/containing municipality - not a
-    single blended point. Tried averaging the stations' raw lon/lat (and separately, their position
-    along the coastline/river axis) first and then finding the nearest municipality to *that* - both
-    can land somewhere with no real connection to any contributing station whenever they're not
-    roughly collinear (confirmed by direct testing: Den Helder + Vlissingen's flat centroid lands near
-    Wassenaar, nowhere near the coast at all). Each station's own nearest_municipality() is
-    individually grounded and correct, so the real combination of "first affected" places for an
-    event that crossed threshold at several gauges simultaneously is just their union - de-duplicated,
-    since two stations can share a municipality. Returns the raw municipality features (not merged
-    into one geometry), in no particular order."""
-    picked = {}
-    for code in station_weights:
-        muni = nearest_municipality(station_lonlat(code, locations), municipalities)
-        picked[muni["properties"]["code"]] = muni
-    return list(picked.values())
+def weighted_centroid_lonlat(station_weights: dict, locations) -> tuple:
+    """The weighted centroid (RD/metric space, reprojected back to WGS84) of every station that
+    crossed its own threshold for one event - e.g. the 1953 storm surge's Vlissingen 453 (high), Hoek
+    van Holland 381 (high), Dordrecht 370 (high), Harlingen 365 (medium), Den Helder 322 (medium) pulls
+    the point toward Vlissingen without discarding the other four. `station_weights` is {code:
+    weight}; weights need only be comparable to each other (e.g. peak_level values are already
+    directly comparable within one event, since every contributing station shares the same kind/units
+    by construction)."""
+    points_rd = [_reproject(Point(station_lonlat(code, locations)), TO_RD) for code in station_weights]
+    weights = list(station_weights.values())
+    total = sum(weights)
+    x = sum(p.x * w for p, w in zip(points_rd, weights)) / total
+    y = sum(p.y * w for p, w in zip(points_rd, weights)) / total
+    centroid_wgs84 = _reproject(Point(x, y), TO_WGS84)
+    return centroid_wgs84.x, centroid_wgs84.y

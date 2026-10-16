@@ -3,6 +3,7 @@ import os
 import sys
 
 import pandas as pd
+import pytest
 from shapely.geometry import Point, box, mapping
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -55,25 +56,23 @@ def test_severity_fraction():
     assert fg.severity_fraction(100.0, 0.0) == 1.0  # guard against a zero/missing reference
 
 
-def test_combined_first_municipalities_unions_per_station_not_a_blended_point():
+def test_weighted_centroid_lonlat_pulls_toward_the_heavier_station():
     locations = _fake_locations()
-    municipalities = _fake_municipalities()
 
-    # A single contributing station resolves to exactly its own nearest municipality.
-    single = fg.combined_first_municipalities({"up": 100.0}, locations, municipalities)
-    assert [m["properties"]["code"] for m in single] == ["A"]
+    # A single contributing station: centroid of one point is just that point.
+    up_lonlat = fg.station_lonlat("up", locations)
+    assert fg.weighted_centroid_lonlat({"up": 100.0}, locations) == pytest.approx(up_lonlat)
 
-    # Two far-apart contributing stations ("up" -> A, "down" -> C) combine as their own 2 real
-    # municipalities, not a single municipality nearest some blended midpoint between them (which
-    # would wrongly land on B here, the real failure mode this function was written to avoid).
-    combined = fg.combined_first_municipalities({"up": 10.0, "down": 1.0}, locations, municipalities)
-    codes = {m["properties"]["code"] for m in combined}
-    assert codes == {"A", "C"}
+    # Equal weights: centroid sits at the midpoint.
+    mid_lonlat = fg.station_lonlat("mid", locations)
+    down_lonlat = fg.station_lonlat("down", locations)
+    equal = fg.weighted_centroid_lonlat({"mid": 1.0, "down": 1.0}, locations)
+    assert equal == pytest.approx(((mid_lonlat[0] + down_lonlat[0]) / 2,
+                                    (mid_lonlat[1] + down_lonlat[1]) / 2), abs=1e-4)
 
-    # Two stations that happen to share the same nearest municipality de-duplicate to one result.
-    deduped = fg.combined_first_municipalities({"up": 10.0, "mid": 1.0}, locations,
-                                                 [_fake_municipalities()[0]])  # only "A" exists
-    assert len(deduped) == 1
+    # Unequal weights: centroid is closer to the heavier station than to the lighter one.
+    heavy_up = fg.weighted_centroid_lonlat({"up": 100.0, "down": 1.0}, locations)
+    assert abs(heavy_up[0] - up_lonlat[0]) < abs(heavy_up[0] - down_lonlat[0])
 
 
 def test_learn_reach_profile_measures_known_offsets(monkeypatch):

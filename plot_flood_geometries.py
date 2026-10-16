@@ -11,21 +11,19 @@ Events are grouped into one toggleable layer per decade (via folium's native Lay
 of the map) - all decades are shown by default, un-check any to filter them out interactively without
 regenerating the map.
 
-Default --geometry is "first_municipality": the municipality (or municipalities - from
---municipalities, default the 1820 map) nearest each contributing station, combined - not just
-nearest to the event's single worst_station. events.csv only keeps the one worst-performing gauge per
-national event, but station_events.csv still has every individual station that crossed its own
-threshold within that event's window (47% of events - 126/267 - actually involve 2-6 distinct stations
-at once, e.g. a storm surge hitting Vlissingen and Harlingen simultaneously).
-flood_geometry.combined_first_municipalities() looks up each contributing station's own
-nearest/containing municipality and unions them - not a single blended point: averaging the stations'
-raw positions first (either their lon/lat directly, or their position along the coastline/river axis)
-and then finding the nearest municipality to *that* can land somewhere with no real connection to any
-contributing station, confirmed by direct testing (Den Helder + Vlissingen's flat centroid lands near
-Wassenaar, nowhere near the coast). A single-station event (the other 53%) still resolves to exactly
-its own station's municipality. --geometry extent plots the full synthesized municipality-union
-instead (much more overlap, since it's severity-scaled and can span dozens of municipalities);
---geometry point plots a marker sized by severity instead of any shape at all.
+Default --geometry is "first_municipality": the single municipality (from --municipalities, default
+the 1820 map) nearest the *weighted centroid* of every station that crossed its own threshold for that
+event - not just the event's single worst_station. events.csv only keeps the one worst-performing
+gauge per national event, but station_events.csv still has every individual station involved (47% of
+events - 126/267 - actually involve 2-6 distinct stations at once). E.g. the 1953 storm surge's
+Vlissingen 453 (high), Hoek van Holland 381 (high), Dordrecht 370 (high), Harlingen 365 (medium), Den
+Helder 322 (medium) are combined via flood_geometry.weighted_centroid_lonlat() into one point pulled
+toward Vlissingen (the highest weight) without discarding the other four, then resolved to that
+point's own nearest municipality. A single-station event (the other 53%) still resolves to exactly its
+own station's municipality, since a weighted centroid of one point is just that point. --geometry
+extent plots the full synthesized municipality-union instead (much more overlap, since it's
+severity-scaled and can span dozens of municipalities); --geometry point plots a marker sized by
+severity instead of any shape at all.
 
 Usage:
     python3 plot_flood_geometries.py --geojson flood_events_output/flood_events.geojson \
@@ -37,7 +35,6 @@ import json
 import folium
 import pandas as pd
 from shapely.geometry import mapping, shape
-from shapely.ops import unary_union
 
 import flood_geometry as fg
 from flood_events import DEFAULT_STATIONS
@@ -199,17 +196,14 @@ def main():
         else:
             if args.geometry == "first_municipality":
                 weights = contributing_station_weights(feature, station_events)
-                cache_key = tuple(sorted(weights))
+                cache_key = tuple(sorted(weights.items()))
                 if cache_key not in municipality_cache:
-                    picked = fg.combined_first_municipalities(weights, locations, municipalities)
-                    geometry = picked[0]["geometry"] if len(picked) == 1 else mapping(
-                        unary_union([shape(m["geometry"]) for m in picked]))
-                    names = [m["properties"]["naam"] for m in picked]
-                    municipality_cache[cache_key] = (geometry, names)
-                geometry, names = municipality_cache[cache_key]
+                    centroid_lonlat = fg.weighted_centroid_lonlat(weights, locations)
+                    municipality_cache[cache_key] = fg.nearest_municipality(centroid_lonlat, municipalities)
+                municipality = municipality_cache[cache_key]
                 render_feature = {"type": "Feature", "properties": dict(feature["properties"]),
-                                   "geometry": geometry}
-                render_feature["properties"]["first_municipality"] = ";".join(names)
+                                   "geometry": municipality["geometry"]}
+                render_feature["properties"]["first_municipality"] = municipality["properties"]["naam"]
                 render_feature["properties"]["n_contributing_stations"] = len(weights)
             else:
                 render_feature = feature
