@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Trains 13 named configs on the Limburg dataset to test candidate fixes for the convergence problem
-# found on the real limburg_flood_eval run: graph_discov/data_loss (S2) climbed almost monotonically
-# through training while held_out/val_mse (the genuinely held-out metric) peaked at epoch 10 and never
-# recovered. Mining that run's checkpoint.pt/TensorBoard history pinned down two concrete events:
+# Trains 13 named configs on a region's dataset (REGION, default limburg - see Usage) to test
+# candidate fixes for the convergence problem found on the real limburg_flood_eval run:
+# graph_discov/data_loss (S2) climbed almost monotonically through training while held_out/val_mse
+# (the genuinely held-out metric) peaked at epoch 10 and never recovered. Mining that run's
+# checkpoint.pt/TensorBoard history pinned down two concrete events:
 #   1. A group-refinement reset at epoch 5 (n_groups jumps 32 -> 57 = n_nodes in one step, discarding
 #      all Adam momentum via a brand-new graph optimizer) - data_loss climbs for 5 epochs right after
 #      this while held_out/val_mse actually *improves* over the same window (its best value is at
@@ -37,6 +38,13 @@
 # training-loop changes needed to test them (a real fix - preserving Adam momentum across a group-
 # refinement reset instead of discarding it - is a plausible follow-up if this sweep confirms the
 # reset is the dominant contributor, but is out of scope here).
+#
+# Every specific number below (crash epochs, strict_availability's 0.15 threshold, the 0.03-0.08
+# stable lambda_s range) was found on Limburg, whose stations run ~78% missing on the default
+# --min-channel-availability. Running this same script against another REGION (e.g. zeeland, a
+# coastal storm-surge regime rather than Limburg's river-discharge one - see flood_events_output/
+# station_events.csv's Vlissingen entries, including the 1953 North Sea flood) is exactly how to check
+# whether these findings are Limburg-specific or general; don't assume they transfer without checking.
 #
 # Configs:
 #   baseline              reproduces the real run's config (fill_policy rate_0.1_after_10, default
@@ -82,24 +90,26 @@
 #                         resolution, to find where (if anywhere) val_mse's late upward drift starts
 #
 # Usage:
-#   cuts_plus_prototype/sweep_convergence.sh [total_epoch] [predict_chunk_size] [held_out_eval_every]
+#   cuts_plus_prototype/sweep_convergence.sh [total_epoch] [predict_chunk_size] [held_out_eval_every] [region]
 #
 #   total_epoch          default 50 (matches the real run, for comparability)
 #   predict_chunk_size   default 32
 #   held_out_eval_every  default 2 (finer than the 5 used before, to localize the epoch-5-15 dynamics)
+#   region               default limburg - any region build_dataset.sh knows (currently limburg/zeeland)
 set -euo pipefail
 
 TOTAL_EPOCH="${1:-50}"
 PREDICT_CHUNK_SIZE="${2:-32}"
 HELD_OUT_EVAL_EVERY="${3:-2}"
+REGION="${4:-limburg}"
 
 LAMBDA_S_START=0.3
 LAMBDA_S_END=0.03
 
-SWEEP_ROOT=cuts_plus_prototype/scratch/convergence_sweep
+SWEEP_ROOT=cuts_plus_prototype/scratch/convergence_sweep_$REGION
 # Built outside SWEEP_ROOT (not a sibling of the config run dirs) so compare_fill_policies.py
 # --sweep-root "$SWEEP_ROOT" only ever sees the 13 config directories, not this dataset build too.
-DATA_DIR=cuts_plus_prototype/scratch/convergence_dataset_limburg
+DATA_DIR=cuts_plus_prototype/scratch/convergence_dataset_$REGION
 
 CONFIGS=(baseline no_coarse_to_fine gentle_anneal delayed_fill_policy combined strict_availability
           no_anneal sparsity_low sparsity_mid sparsity_high
@@ -120,8 +130,8 @@ declare -A CONFIG_OVERRIDES=(
   [sparsity_fine_08]="--end-tau 1.0 --lambda-s-start 0.08 --lambda-s-end 0.08"
 )
 
-echo "=== Building Limburg dataset -> $DATA_DIR ==="
-cuts_plus_prototype/build_dataset.sh "$DATA_DIR" limburg rws_waterinfo "" ""
+echo "=== Building $REGION dataset -> $DATA_DIR ==="
+cuts_plus_prototype/build_dataset.sh "$DATA_DIR" "$REGION" rws_waterinfo "" ""
 
 for config in "${CONFIGS[@]}"; do
   run_dir="$SWEEP_ROOT/$config"
