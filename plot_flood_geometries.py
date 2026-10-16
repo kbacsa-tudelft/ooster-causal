@@ -64,12 +64,12 @@ def make_style_function(color_by: str):
         return {
             "fillColor": palette.get(props.get(color_by), "#95a5a6"),
             "color": "#2c3e50",
-            "weight": 1,
+            "weight": 1.5,
             "dashArray": None if props.get("extent_source") == "digitized" else "6,4",
             # Low opacity so heavily-overlapping shapes (many events share the same handful of anchor
             # stations - see module docstring) build up darker where they stack, rather than one
             # fully occluding the others underneath it.
-            "fillOpacity": 0.12,
+            "fillOpacity": 0.2,
         }
     return style_function
 
