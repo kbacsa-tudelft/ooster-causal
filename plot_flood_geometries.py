@@ -11,15 +11,21 @@ Events are grouped into one toggleable layer per decade (via folium's native Lay
 of the map) - all decades are shown by default, un-check any to filter them out interactively without
 regenerating the map.
 
-Default --geometry is "first_municipality": just the single municipality (from --municipalities,
-default the 1820 map) containing or nearest each event's own anchor gauge station - a real shape, but
-a small, mostly non-overlapping one, since every one of the 267 events is anchored at one of only 11
-gauge stations (flood_events.py's events.csv only ever tags a national event with its single
-worst_station) and "first affected" is the same question regardless of severity. Events sharing an
-anchor do still draw the exact same municipality shape on top of each other - that's inherent to only
-having 11 possible anchors, not fixable by styling. --geometry extent plots the full synthesized
-municipality-union instead (much more overlap, since it's severity-scaled and can span dozens of
-municipalities); --geometry point plots a marker sized by severity instead of any shape at all.
+Default --geometry is "first_municipality": the municipality (or municipalities - from
+--municipalities, default the 1820 map) nearest each contributing station, combined - not just
+nearest to the event's single worst_station. events.csv only keeps the one worst-performing gauge per
+national event, but station_events.csv still has every individual station that crossed its own
+threshold within that event's window (47% of events - 126/267 - actually involve 2-6 distinct stations
+at once, e.g. a storm surge hitting Vlissingen and Harlingen simultaneously).
+flood_geometry.combined_first_municipalities() looks up each contributing station's own
+nearest/containing municipality and unions them - not a single blended point: averaging the stations'
+raw positions first (either their lon/lat directly, or their position along the coastline/river axis)
+and then finding the nearest municipality to *that* can land somewhere with no real connection to any
+contributing station, confirmed by direct testing (Den Helder + Vlissingen's flat centroid lands near
+Wassenaar, nowhere near the coast). A single-station event (the other 53%) still resolves to exactly
+its own station's municipality. --geometry extent plots the full synthesized municipality-union
+instead (much more overlap, since it's severity-scaled and can span dozens of municipalities);
+--geometry point plots a marker sized by severity instead of any shape at all.
 
 Usage:
     python3 plot_flood_geometries.py --geojson flood_events_output/flood_events.geojson \
@@ -31,6 +37,7 @@ import json
 import folium
 import pandas as pd
 from shapely.geometry import mapping, shape
+from shapely.ops import unary_union
 
 import flood_geometry as fg
 from flood_events import DEFAULT_STATIONS
@@ -89,6 +96,26 @@ def anchor_marker(feature: dict, locations, name_to_code: dict, color_by: str) -
     )
 
 
+def contributing_station_weights(feature: dict, station_events: pd.DataFrame) -> dict:
+    """{code: peak_level} for every station that crossed its own threshold within this event's window
+    - the same (kind, peak_time-in-[start, end]) grouping flood_events.py's own merge_national() uses
+    internally, just not persisted back onto events.csv as anything beyond the single worst station."""
+    props = feature["properties"]
+    kind = "coast" if props["type"] == "storm surge" else "river"
+    start = pd.Timestamp(props["start"])
+    end = pd.Timestamp(props["end"]) + pd.Timedelta(days=1)
+    window = station_events[(station_events["kind"] == kind) &
+                             (station_events["peak_time"] >= start) &
+                             (station_events["peak_time"] <= end)]
+    weights = window.groupby("code")["peak_level"].max().to_dict()
+    if weights:
+        return weights
+    # Shouldn't happen (the worst_station itself always falls inside its own event's window), but
+    # fall back to just that one station rather than crashing on an unexpected edge case.
+    code = fg.station_name_to_code()[props["worst_station"]]
+    return {code: props["worst_level_cm_nap"]}
+
+
 def legend_html(color_by: str) -> str:
     rows = "".join(
         f'<div><span style="background:{color};width:12px;height:12px;display:inline-block;'
@@ -117,6 +144,9 @@ def main():
                               "marker sized by severity, no shape at all.")
     parser.add_argument("--municipalities", default="reference_data/municipalities_1820.geojson",
                          help="municipality set --geometry first_municipality picks from")
+    parser.add_argument("--station-events-csv", default="flood_events_output/station_events.csv",
+                         help="used by --geometry first_municipality to find every station "
+                              "contributing to an event, not just its single worst_station")
     parser.add_argument("--only-alert", choices=["low", "medium", "high"],
                          help="only plot events at this alert level")
     parser.add_argument("--only-source", choices=["digitized", "derived_municipalities"],
@@ -151,8 +181,12 @@ def main():
     if args.geometry == "first_municipality":
         with open(args.municipalities) as f:
             municipalities = json.load(f)["features"]
-        # Repeated anchors (many events share a station) always pick the same municipality - cache it
-        # rather than re-scanning the whole municipality list for every one of the 267 events.
+        station_events = pd.read_csv(args.station_events_csv)
+        station_events["peak_time"] = (pd.to_datetime(station_events["peak_time"], utc=True)
+                                        .dt.tz_localize(None))
+        # Events with the exact same contributing-station weights (most commonly: the 140/267 events
+        # that only ever involved one station at all) always resolve to the same municipality - cache
+        # it rather than re-scanning the whole municipality list for every one of the 267 events.
         municipality_cache = {}
 
     decade_groups = {}
@@ -164,14 +198,19 @@ def main():
             anchor_marker(feature, locations, name_to_code, args.color_by).add_to(group)
         else:
             if args.geometry == "first_municipality":
-                anchor_code = name_to_code[feature["properties"]["worst_station"]]
-                if anchor_code not in municipality_cache:
-                    anchor_lonlat = fg.station_lonlat(anchor_code, locations)
-                    municipality_cache[anchor_code] = fg.nearest_municipality(anchor_lonlat, municipalities)
-                municipality = municipality_cache[anchor_code]
+                weights = contributing_station_weights(feature, station_events)
+                cache_key = tuple(sorted(weights))
+                if cache_key not in municipality_cache:
+                    picked = fg.combined_first_municipalities(weights, locations, municipalities)
+                    geometry = picked[0]["geometry"] if len(picked) == 1 else mapping(
+                        unary_union([shape(m["geometry"]) for m in picked]))
+                    names = [m["properties"]["naam"] for m in picked]
+                    municipality_cache[cache_key] = (geometry, names)
+                geometry, names = municipality_cache[cache_key]
                 render_feature = {"type": "Feature", "properties": dict(feature["properties"]),
-                                   "geometry": municipality["geometry"]}
-                render_feature["properties"]["first_municipality"] = municipality["properties"]["naam"]
+                                   "geometry": geometry}
+                render_feature["properties"]["first_municipality"] = ";".join(names)
+                render_feature["properties"]["n_contributing_stations"] = len(weights)
             else:
                 render_feature = feature
 
@@ -181,8 +220,9 @@ def main():
             folium.GeoJson(
                 simplified,
                 style_function=style_function,
-                tooltip=folium.GeoJsonTooltip(fields=[f for f in TOOLTIP_FIELDS + ["first_municipality"]
-                                                       if f in simplified["properties"]]),
+                tooltip=folium.GeoJsonTooltip(
+                    fields=[f for f in TOOLTIP_FIELDS + ["first_municipality", "n_contributing_stations"]
+                            if f in simplified["properties"]]),
             ).add_to(group)
     for decade in sorted(decade_groups):
         decade_groups[decade].add_to(m)

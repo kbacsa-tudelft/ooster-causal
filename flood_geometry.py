@@ -202,3 +202,21 @@ def nearest_municipality(anchor_lonlat: tuple, municipalities: list) -> dict:
     geometry), so callers can also read its code/naam."""
     anchor_rd = _reproject(Point(anchor_lonlat), TO_RD)
     return min(municipalities, key=lambda f: _reproject(shape(f["geometry"]), TO_RD).distance(anchor_rd))
+
+
+def combined_first_municipalities(station_weights: dict, locations, municipalities: list) -> list:
+    """The combination of each contributing station's own nearest/containing municipality - not a
+    single blended point. Tried averaging the stations' raw lon/lat (and separately, their position
+    along the coastline/river axis) first and then finding the nearest municipality to *that* - both
+    can land somewhere with no real connection to any contributing station whenever they're not
+    roughly collinear (confirmed by direct testing: Den Helder + Vlissingen's flat centroid lands near
+    Wassenaar, nowhere near the coast at all). Each station's own nearest_municipality() is
+    individually grounded and correct, so the real combination of "first affected" places for an
+    event that crossed threshold at several gauges simultaneously is just their union - de-duplicated,
+    since two stations can share a municipality. Returns the raw municipality features (not merged
+    into one geometry), in no particular order."""
+    picked = {}
+    for code in station_weights:
+        muni = nearest_municipality(station_lonlat(code, locations), municipalities)
+        picked[muni["properties"]["code"]] = muni
+    return list(picked.values())

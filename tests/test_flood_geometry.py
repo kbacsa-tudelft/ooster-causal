@@ -55,6 +55,27 @@ def test_severity_fraction():
     assert fg.severity_fraction(100.0, 0.0) == 1.0  # guard against a zero/missing reference
 
 
+def test_combined_first_municipalities_unions_per_station_not_a_blended_point():
+    locations = _fake_locations()
+    municipalities = _fake_municipalities()
+
+    # A single contributing station resolves to exactly its own nearest municipality.
+    single = fg.combined_first_municipalities({"up": 100.0}, locations, municipalities)
+    assert [m["properties"]["code"] for m in single] == ["A"]
+
+    # Two far-apart contributing stations ("up" -> A, "down" -> C) combine as their own 2 real
+    # municipalities, not a single municipality nearest some blended midpoint between them (which
+    # would wrongly land on B here, the real failure mode this function was written to avoid).
+    combined = fg.combined_first_municipalities({"up": 10.0, "down": 1.0}, locations, municipalities)
+    codes = {m["properties"]["code"] for m in combined}
+    assert codes == {"A", "C"}
+
+    # Two stations that happen to share the same nearest municipality de-duplicate to one result.
+    deduped = fg.combined_first_municipalities({"up": 10.0, "mid": 1.0}, locations,
+                                                 [_fake_municipalities()[0]])  # only "A" exists
+    assert len(deduped) == 1
+
+
 def test_learn_reach_profile_measures_known_offsets(monkeypatch):
     monkeypatch.setattr(fg, "RIVER_BRANCHES", {"fake": ["up", "mid", "down"]})
     locations = _fake_locations()
