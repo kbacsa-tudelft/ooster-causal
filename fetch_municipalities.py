@@ -1,16 +1,28 @@
 """
-One-time fetch of Dutch municipality (gemeente) boundaries from PDOK/Kadaster's public OGC API
-(CC BY 4.0, no auth required), trimmed to the municipalities near the 10 ROR historical flood events
-(extract_ror_events.py's output) and written as a small, committed reference GeoJSON file.
+Fetches Dutch municipality boundaries for a given year from NLGis (Zijdeman & Mac Gillavry,
+DataverseNL, DOI 10.34894/4G2NJM, CC-BY-SA-4.0) - yearly boundary files covering 1812-2020, each a
+public GeoJSON download with no account/login required (confirmed directly). Trims to the
+municipalities near the 6 candidate ROR historical flood events and the 11 flood_events.py gauge
+stations, and writes a small, committed reference GeoJSON file.
 
-Unlike every other output in this project, this file is meant to be committed: it's static long-term
-reference geography, not a per-run generated artifact, and committing it avoids a live network
-dependency for every future flood-geometry run. Rerun this script only if PDOK's data updates or the
-set of ROR source events changes.
+Historical boundaries matter here because the Netherlands has steadily merged municipalities for
+efficiency - 342 today vs. 1,249 in 1820 (confirmed the national maximum across the dataset, by
+sampling feature counts year by year) and 1,014 in 1953 alone - so fetching whichever year is actually
+relevant gives far finer granularity for the flood-geometry synthesis than today's boundaries would:
+  - Each of the 6 candidate ROR events' own reach profile (flood_geometry.learn_reach_profile) uses
+    that event's own year (1916/1926/1953/1993/1995), for historically accurate measurement.
+  - Every synthesized (non-template) event uses year 1820, the single most granular map available,
+    uniformly - per the user's explicit choice, visualization granularity matters more here than using
+    each event's own (less detailed) contemporary boundaries.
+
+Unlike every other output in this project, these files are meant to be committed: they're static
+long-term reference geography, not a per-run generated artifact, and committing them avoids a live
+network dependency for every future flood-geometry run. Rerun this script only if NLGis's data updates
+or the set of ROR source events changes.
 
 Usage:
-    python3 fetch_municipalities.py --ror-events-geojson flood_events_output/ror_historical_events.geojson \
-        --out reference_data/municipalities.geojson
+    python3 fetch_municipalities.py --year 1820 --out reference_data/municipalities_1820.geojson
+    python3 fetch_municipalities.py --year 1953 --out reference_data/municipalities_1953.geojson
 """
 import argparse
 import json
@@ -26,11 +38,12 @@ from shapely.ops import unary_union
 
 from flood_events import DEFAULT_STATIONS
 
-PDOK_ITEMS_URL = (
-    "https://api.pdok.nl/kadaster/bestuurlijkegebieden/ogc/v1/collections/gemeentegebied/items"
-    "?f=json&limit=1000"
-)
-KEEP_PROPERTIES = ["code", "identificatie", "naam", "ligt_in_provincie_code", "ligt_in_provincie_naam"]
+NLGIS_DATASET_API = "https://dataverse.nl/api/datasets/:persistentId/?persistentId=doi:10.34894/4G2NJM"
+NLGIS_FILE_ACCESS = "https://dataverse.nl/api/access/datafile/{file_id}"
+# NLGis properties are naam/acode/cbscode/year - renamed to "code"/"naam" on output so every downstream
+# consumer (flood_geometry.py) can read either a NLGis-year file or (previously) a PDOK file the same
+# way, without caring which source or year it came from.
+KEEP_PROPERTIES = {"cbscode": "code", "naam": "naam"}
 
 # Only the 6 "Hoofdwatersysteem" ROR events (nr 1-6) are ever used downstream (flood_geometry.py's
 # STORM_SURGE_CANDIDATES/RIVER_CANDIDATES) - the 4 "Regionaal watersysteem" ones (nr 7-10, canal/peat-
@@ -51,21 +64,24 @@ def _reproject(geom, transformer: Transformer):
     return shapely.transform(geom, _apply)
 
 
-def fetch_all_municipalities(start_url: str) -> list:
-    """Follows the OGC API's own 'next' pagination link until exhausted (confirmed in practice to
-    return all ~342 municipalities in one page at limit=1000, but paginate defensively in case a future
-    server-side limit is lower)."""
-    features = []
-    url = start_url
-    for _ in range(50):  # safety cap, well above any plausible page count
-        with urllib.request.urlopen(url, timeout=60) as resp:
-            data = json.load(resp)
-        features.extend(data["features"])
-        links = {link["rel"]: link["href"] for link in data.get("links", [])}
-        if "next" not in links:
-            break
-        url = links["next"]
-    return features
+def resolve_file_id(year: int) -> int:
+    """NLGis file ids aren't a documented/guaranteed sequence - look up the real id for nl_<year>.geojson
+    from the dataset's own file list rather than assuming any numbering pattern."""
+    with urllib.request.urlopen(NLGIS_DATASET_API, timeout=30) as resp:
+        data = json.load(resp)
+    target = f"nl_{year}.geojson"
+    for f in data["data"]["latestVersion"]["files"]:
+        if f["dataFile"]["filename"] == target:
+            return f["dataFile"]["id"]
+    raise ValueError(f"{target} not found in the NLGis dataset file list (valid range: 1812-2020)")
+
+
+def fetch_year(year: int) -> list:
+    file_id = resolve_file_id(year)
+    url = NLGIS_FILE_ACCESS.format(file_id=file_id)
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        data = json.load(resp)
+    return data["features"]
 
 
 def build_search_region(ror_events_geojson: str, locations_csv: str, buffer_km: float):
@@ -96,23 +112,24 @@ def build_search_region(ror_events_geojson: str, locations_csv: str, buffer_km: 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--year", type=int, required=True,
+                         help="which NLGis yearly boundary file to fetch (1812-2020)")
     parser.add_argument("--ror-events-geojson", default="flood_events_output/ror_historical_events.geojson")
-    parser.add_argument("--out", default="reference_data/municipalities.geojson")
+    parser.add_argument("--out", default=None,
+                         help="default: reference_data/municipalities_<year>.geojson")
     parser.add_argument("--buffer-km", type=float, default=20.0,
                          help="how far beyond the 6 candidate ROR events' real extents and the 11 "
                               "gauge stations' own locations to also keep neighboring municipalities")
     parser.add_argument("--locations-csv", default="rws_waterinfo/locations.csv")
-    parser.add_argument("--pdok-url", default=PDOK_ITEMS_URL)
     parser.add_argument("--simplify-deg", type=float, default=0.0005,
-                         help="shapely simplify() tolerance in degrees (~50m) - PDOK's boundaries are "
-                              "survey-grade detailed (hundreds of vertices per municipality), far more "
-                              "precise than this project's coarse corridor-intersection use needs; "
-                              "simplifying keeps the committed file a reasonable size")
+                         help="shapely simplify() tolerance in degrees (~50m), to keep the committed "
+                              "file a reasonable size")
     args = parser.parse_args()
+    out = args.out or f"reference_data/municipalities_{args.year}.geojson"
 
-    print(f"Fetching municipality boundaries from {args.pdok_url} ...")
-    raw_features = fetch_all_municipalities(args.pdok_url)
-    print(f"Fetched {len(raw_features)} municipalities nationwide")
+    print(f"Fetching NLGis {args.year} municipality boundaries ...")
+    raw_features = fetch_year(args.year)
+    print(f"Fetched {len(raw_features)} municipalities nationwide for {args.year}")
 
     search_region = build_search_region(args.ror_events_geojson, args.locations_csv, args.buffer_km)
 
@@ -121,19 +138,20 @@ def main():
         geom = shape(feature["geometry"])
         if geom.intersects(search_region):
             simplified = geom.simplify(args.simplify_deg, preserve_topology=True)
-            props = {k: feature["properties"].get(k) for k in KEEP_PROPERTIES}
+            props = {out_key: feature["properties"].get(in_key)
+                     for in_key, out_key in KEEP_PROPERTIES.items()}
             kept.append({"type": "Feature", "properties": props,
                          "geometry": mapping(simplified)})
 
     kept.sort(key=lambda f: f["properties"]["code"])
     collection = {"type": "FeatureCollection", "features": kept}
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "w", encoding="utf-8") as f:
         json.dump(collection, f, indent=2)
 
     print(f"Kept {len(kept)}/{len(raw_features)} municipalities within {args.buffer_km}km of the 6 "
-          f"candidate ROR events' real extents or the 11 gauge stations -> {args.out}")
+          f"candidate ROR events' real extents or the 11 gauge stations -> {out}")
 
 
 if __name__ == "__main__":

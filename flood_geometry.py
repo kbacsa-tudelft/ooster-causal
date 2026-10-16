@@ -2,9 +2,9 @@
 Synthesizes a flood-extent polygon for every flood_events.py-computed national event (events.csv),
 by borrowing a *reach profile* - how far one of the 10 ROR historical events actually reaches upstream/
 downstream along its river (or along the coast) and inland from its anchor gauge station, measured
-against real Dutch municipality boundaries (reference_data/municipalities.geojson, see
-fetch_municipalities.py) - and scaling that profile by the event's severity relative to its matched ROR
-counterpart. The output is a *fresh* shape: the union of whichever real municipality polygons fall
+against real Dutch municipality boundaries for the relevant year (reference_data/municipalities_<year>.
+geojson, see fetch_municipalities.py) - and scaling that profile by the event's severity relative to
+its matched ROR counterpart. The output is a *fresh* shape: the union of whichever real municipality polygons fall
 inside the severity-scaled search region, not a copy of the ROR polygon itself.
 
 Only the 6 "Hoofdwatersysteem" ROR events are valid templates (see build_flood_geometries.py's

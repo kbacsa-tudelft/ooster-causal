@@ -10,10 +10,20 @@ canal breaks, a peat-dike slide, a water-main break) are a different flood mecha
 11-station national gauge network this project's events.csv is built from can ever detect, confirmed by
 their centroids being small, locally-unrelated patches unrelated to the national river/coastal system.
 
+Each of the 6 candidate ROR events' own reach profile (flood_geometry.learn_reach_profile) is measured
+against the municipalities that actually existed in that event's own year (1916/1926/1953/1993/1995 -
+see fetch_municipalities.py), not today's much-merged ones, since the real polygon's reach should be
+read against the administrative units that existed when it happened. Every synthesized (non-template)
+event instead uses a single fixed year (1820 by default, the most municipality-dense year available -
+see fetch_municipalities.py's docstring) for all ~257 of them uniformly: using each event's own
+contemporary year here would need ~70 separate boundary files for marginal gain, and visualization
+granularity matters more than per-event historical accuracy for this part (explicit user choice).
+
 Usage:
     python3 build_flood_geometries.py --events-csv flood_events_output/events.csv \
         --ror-events-geojson flood_events_output/ror_historical_events.geojson \
-        --municipalities reference_data/municipalities.geojson \
+        --synthesis-municipalities reference_data/municipalities_1820.geojson \
+        --municipalities-dir reference_data \
         --out flood_events_output/flood_events.geojson
 """
 import argparse
@@ -85,7 +95,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--events-csv", default="flood_events_output/events.csv")
     parser.add_argument("--ror-events-geojson", default="flood_events_output/ror_historical_events.geojson")
-    parser.add_argument("--municipalities", default="reference_data/municipalities.geojson")
+    parser.add_argument("--synthesis-municipalities", default="reference_data/municipalities_1820.geojson",
+                         help="the single municipality set used for every synthesized (non-template) "
+                              "event's extent")
+    parser.add_argument("--municipalities-dir", default="reference_data",
+                         help="directory holding municipalities_<year>.geojson for each of the 6 "
+                              "candidate ROR events' own years, used only for reach-profile learning")
     parser.add_argument("--locations-csv", default="rws_waterinfo/locations.csv")
     parser.add_argument("--out", default="flood_events_output/flood_events.geojson")
     args = parser.parse_args()
@@ -93,8 +108,8 @@ def main():
     events = pd.read_csv(args.events_csv)
     events["peak_date"] = pd.to_datetime(events["peak_date"])
     locations = pd.read_csv(args.locations_csv, index_col="name")
-    with open(args.municipalities) as f:
-        municipalities = json.load(f)["features"]
+    with open(args.synthesis_municipalities) as f:
+        synthesis_municipalities = json.load(f)["features"]
     ror_by_nr = load_ror_candidates(args.ror_events_geojson)
     ror_geom_by_nr = {nr: shape(f["geometry"]) for nr, f in ror_by_nr.items()}
     ror_centroids = {nr: g.centroid for nr, g in ror_geom_by_nr.items()}
@@ -125,10 +140,19 @@ def main():
         anchor_code_for_nr[nr] = fg.nearest_station(
             (ror_centroids[nr].x, ror_centroids[nr].y), station_codes, locations)
         anchor_lonlat = fg.station_lonlat(anchor_code_for_nr[nr], locations)
+
+        # This nr's own historical year's boundaries, not today's much-merged ones (see module
+        # docstring) - the real ROR polygon's reach should be measured against the administrative
+        # units that existed when that flood actually happened.
+        template_year = ror_by_nr[nr]["properties"]["jaar"]
+        municipalities_path = os.path.join(args.municipalities_dir, f"municipalities_{template_year}.geojson")
+        with open(municipalities_path) as f:
+            template_municipalities = json.load(f)["features"]
+
         reach_profile[nr] = fg.learn_reach_profile(
-            ror_geom_by_nr[nr], municipalities, event_type, anchor_lonlat, locations)
-        print(f"  nr {nr}: reference_level={reference_level[nr]:.0f}, anchor={anchor_code_for_nr[nr]}, "
-              f"profile={reach_profile[nr]}")
+            ror_geom_by_nr[nr], template_municipalities, event_type, anchor_lonlat, locations)
+        print(f"  nr {nr} ({template_year}): reference_level={reference_level[nr]:.0f}, "
+              f"anchor={anchor_code_for_nr[nr]}, profile={reach_profile[nr]}")
 
     features = []
     n_digitized, n_derived = 0, 0
@@ -152,7 +176,8 @@ def main():
             nr = fg.nearest_template(row["type"], anchor_lonlat, ror_centroids)
             fraction = fg.severity_fraction(row["worst_level_cm_nap"], reference_level[nr])
             geometry, affected = fg.synthesize_extent(
-                reach_profile[nr], row["type"], anchor_lonlat, fraction, locations, municipalities)
+                reach_profile[nr], row["type"], anchor_lonlat, fraction, locations,
+                synthesis_municipalities)
             props["matched_nr"] = str(nr)
             props["extent_source"] = "derived_municipalities"
             props["severity_fraction"] = fraction
