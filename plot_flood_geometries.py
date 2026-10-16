@@ -49,6 +49,10 @@ TILES_ATTR = "Esri, HERE, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors
 
 TOOLTIP_FIELDS = ["peak_date", "type", "alert", "worst_station", "extent_source", "matched_nr",
                    "severity_fraction", "affected_municipalities"]
+# Long municipality lists (first_municipality/affected_municipalities) otherwise render as one
+# unbroken line that runs off the visible tooltip - force wrapping and cap the width so it reads as
+# a readable block instead.
+TOOLTIP_STYLE = "white-space: normal; word-wrap: break-word; max-width: 280px;"
 
 
 def decade_label(peak_date: str) -> str:
@@ -90,7 +94,7 @@ def anchor_marker(feature: dict, locations, name_to_code: dict, color_by: str) -
         color="#2c3e50", weight=1 if props.get("extent_source") == "digitized" else 0.5,
         dash_array=None if props.get("extent_source") == "digitized" else "4,3",
         fill=True, fill_color=palette.get(props.get(color_by), "#95a5a6"), fill_opacity=0.6,
-        tooltip=folium.Tooltip(tooltip_rows),
+        tooltip=folium.Tooltip(tooltip_rows, style=TOOLTIP_STYLE),
     )
 
 
@@ -148,6 +152,9 @@ def main():
     parser.add_argument("--station-events-csv", default="flood_events_output/station_events.csv",
                          help="used by --geometry first_municipality to find every station "
                               "contributing to an event, not just its single worst_station")
+    parser.add_argument("--netherlands-border", default="reference_data/netherlands_border.geojson",
+                         help="country outline drawn for geographic context - pass '' to skip it "
+                              "(see fetch_netherlands_border.py)")
     parser.add_argument("--only-alert", choices=["low", "medium", "high"],
                          help="only plot events at this alert level")
     parser.add_argument("--only-source", choices=["digitized", "derived_municipalities"],
@@ -176,6 +183,14 @@ def main():
     locations = pd.read_csv(args.locations_csv, index_col="name")
     center_lat, center_lon = float(locations["lat"].mean()), float(locations["lon"].mean())
     m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles=TILES_URL, attr=TILES_ATTR)
+
+    if args.netherlands_border:
+        with open(args.netherlands_border) as f:
+            border = json.load(f)
+        folium.GeoJson(
+            border,
+            style_function=lambda _: {"fillOpacity": 0, "color": "#2c3e50", "weight": 2},
+        ).add_to(m)
 
     style_function = make_style_function(args.color_by)
     name_to_code = fg.station_name_to_code()
@@ -212,7 +227,7 @@ def main():
                 geometry, names = municipality_cache[cache_key]
                 render_feature = {"type": "Feature", "properties": dict(feature["properties"]),
                                    "geometry": geometry}
-                render_feature["properties"]["first_municipality"] = ";".join(names)
+                render_feature["properties"]["first_municipality"] = ", ".join(names)
                 render_feature["properties"]["n_contributing_stations"] = len(weights)
             else:
                 render_feature = feature
@@ -225,7 +240,8 @@ def main():
                 style_function=style_function,
                 tooltip=folium.GeoJsonTooltip(
                     fields=[f for f in TOOLTIP_FIELDS + ["first_municipality", "n_contributing_stations"]
-                            if f in simplified["properties"]]),
+                            if f in simplified["properties"]],
+                    style=TOOLTIP_STYLE),
             ).add_to(group)
     for decade in sorted(decade_groups):
         decade_groups[decade].add_to(m)
