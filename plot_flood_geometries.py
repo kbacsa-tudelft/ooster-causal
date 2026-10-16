@@ -11,12 +11,15 @@ Events are grouped into one toggleable layer per decade (via folium's native Lay
 of the map) - all decades are shown by default, un-check any to filter them out interactively without
 regenerating the map.
 
-Default --geometry is "point": plotting all 267 derived_municipalities extents at once produces so
-much polygon overlap (many events share the same nearest-template reach profile) that the map becomes
-unreadable - a marker at each event's own anchor gauge station, sized by severity_fraction, is far
-clearer for seeing "when/where/how severe" at a glance. --geometry extent keeps the original full
-synthesized-polygon rendering, better suited to inspecting one or a few events closely (e.g. with
---only-alert high) than the whole catalog at once.
+Default --geometry is "extent": the real synthesized municipality-union shapes. Every one of the 267
+events is anchored at one of only 11 gauge stations (flood_events.py's events.csv only ever tags a
+national event with its single worst_station) - so many events' extents genuinely do overlap heavily
+around the same handful of locations; that's a property of the underlying data, not a rendering
+artifact, and no amount of styling fully undoes it. Low fillOpacity/thin strokes here keep overlapping
+shapes legible (stacked events build up darker rather than one occluding the rest) without losing the
+actual municipality shapes. --geometry point (a marker at each event's anchor station, sized by
+severity_fraction) is still available for a quick decluttered "when/how severe" overview, at the cost
+of showing a dot instead of a shape.
 
 Usage:
     python3 plot_flood_geometries.py --geojson flood_events_output/flood_events.geojson \
@@ -56,9 +59,12 @@ def make_style_function(color_by: str):
         return {
             "fillColor": palette.get(props.get(color_by), "#95a5a6"),
             "color": "#2c3e50",
-            "weight": 2,
+            "weight": 1,
             "dashArray": None if props.get("extent_source") == "digitized" else "6,4",
-            "fillOpacity": 0.35,
+            # Low opacity so heavily-overlapping shapes (many events share the same handful of anchor
+            # stations - see module docstring) build up darker where they stack, rather than one
+            # fully occluding the others underneath it.
+            "fillOpacity": 0.12,
         }
     return style_function
 
@@ -103,9 +109,10 @@ def main():
     parser.add_argument("--output", default="flood_events_output/flood_map.html")
     parser.add_argument("--color-by", choices=["alert", "type"], default="alert",
                          help="which property to color polygon fills by")
-    parser.add_argument("--geometry", choices=["point", "extent"], default="point",
-                         help="'point': a marker at each event's anchor station, sized by severity - "
-                              "much less visual overlap. 'extent': the full synthesized polygon.")
+    parser.add_argument("--geometry", choices=["point", "extent"], default="extent",
+                         help="'extent': the real synthesized municipality-union shape. 'point': a "
+                              "marker at each event's anchor station, sized by severity - a quick "
+                              "decluttered overview, but loses the actual shape.")
     parser.add_argument("--only-alert", choices=["low", "medium", "high"],
                          help="only plot events at this alert level")
     parser.add_argument("--only-source", choices=["digitized", "derived_municipalities"],
