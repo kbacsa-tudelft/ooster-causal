@@ -32,6 +32,7 @@ import json
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from shapely.geometry import Point, shape
 
@@ -206,7 +207,51 @@ def main():
           f"{table['municipality_code'].nunique()} municipalit(y/ies) -> {out / 'municipality_events.csv'}")
     print(f"  alert mix: high={counts.get('high', 0)}, medium={counts.get('medium', 0)}, "
           f"low={counts.get('low', 0)}")
+
+    write_training_tables(table, per_station, out / "municipality_high")
     return 0
+
+
+def _day_coverage(df: pd.DataFrame) -> float:
+    """Fraction of the full min(start)..max(end) span covered by the union of this table's own
+    [start, end] windows - used to sanity-check how much of the dataset a given alert threshold would
+    actually mask/reroute if fed into mask_flood_events.py/cuts_plus_rca.py's --flood-aware-split.
+    Confirmed this session: municipality_events.csv covers 100% of all days at low+, 27.8% at medium+,
+    but only 6.8% restricted to high - which is why the training-pipeline swap uses high-alert only."""
+    if df.empty:
+        return 0.0
+    start0 = df["start"].min()
+    span_days = (df["end"].max() - start0).days + 1
+    hits = np.zeros(span_days, dtype=bool)
+    for s, e in zip(df["start"], df["end"]):
+        hits[(s - start0).days:(e - start0).days + 1] = True
+    return float(hits.mean())
+
+
+def write_training_tables(municipality_events: pd.DataFrame, municipality_station_events: pd.DataFrame,
+                           out_dir: Path) -> None:
+    """Filters both municipality-level tables to alert=="high" and writes them under the exact
+    filenames cuts_plus_rca.py's --flood-events-csv expects (events.csv + a sibling station_events.csv,
+    its path hardcoded as os.path.join(dirname(flood_events_csv), 'station_events.csv')) - so the
+    training pipeline needs zero code changes to read this directly in place of the original
+    11-station national table. Restricted to "high" because lower thresholds cover an implausibly
+    large fraction of the whole dataset (confirmed this session: 27.8% at medium+, 100% at low+, vs.
+    the national table's 1.3%/4.6% - see _day_coverage); "high" alone (6.8%) is the closest match to
+    the national table's existing scale."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    high_events = municipality_events[municipality_events["alert"] == "high"]
+    high_stations = municipality_station_events[municipality_station_events["alert"] == "high"]
+    high_events.to_csv(out_dir / "events.csv", index=False)
+    high_stations.to_csv(out_dir / "station_events.csv", index=False)
+
+    events_for_coverage = high_events.copy()
+    events_for_coverage["start"] = pd.to_datetime(events_for_coverage["start"])
+    events_for_coverage["end"] = pd.to_datetime(events_for_coverage["end"])
+    coverage = _day_coverage(events_for_coverage)
+    print(f"Wrote {len(high_events)} high-alert municipality event(s) "
+          f"({len(high_stations)} station-level row(s)) -> {out_dir}/events.csv + station_events.csv")
+    print(f"  day-coverage at high-alert: {coverage:.1%} (sanity check - should stay well under the "
+          f"27.8%/100% seen at medium+/low+, not balloon back toward them)")
 
 
 if __name__ == "__main__":

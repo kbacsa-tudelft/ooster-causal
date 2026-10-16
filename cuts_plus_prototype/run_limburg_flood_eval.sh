@@ -4,27 +4,33 @@
 # val_ratio/test_ratio split sweep_fill_policy.sh/run_rws_waterinfo_pipeline.sh use, where a flood could
 # land in train, val, or score depending only on when it happened to occur.
 #
-# --flood-aware-split routes every session touching a --flood-min-alert+ national event window straight
-# to score (test), instead of masking it out of train/val mid-session, then pads score with the most
-# recent flood-free sessions up to the --test-ratio target (0.1 below) and splits the remaining
-# flood-free sessions train/val by --val-ratio (0.1 below) - 0.8/0.1/0.1 overall, confirmed against this
-# dataset's actual flood count (33 of 1330 Limburg sessions touch a medium+ window, well under the 133-
-# session test target) to give an exact 1064/133/133 train/val/score split. Validation stays flood-free,
-# so residual median/std/POT thresholds are calibrated on pure-normal data; score then contains both the
-# flood window itself and the normal timesteps surrounding it in those same sessions, so true/false-
-# positive flood detection (root_cause_analysis's AC@k, computed automatically below since
-# --flood-events-csv is set) has both positive and negative samples to work with. See cuts_plus_rca.py's
-# flood_aware_split config field.
+# --flood-aware-split routes every session touching a --flood-min-alert+ municipality event window
+# straight to score (test), instead of masking it out of train/val mid-session, then pads score with
+# the most recent flood-free sessions up to the --test-ratio target (0.1 below) and splits the
+# remaining flood-free sessions train/val by --val-ratio (0.1 below) - the exact resulting split
+# depends on how many Limburg sessions touch a --flood-min-alert+ window in the actual table in use,
+# so check the printed "Sessions: N train, N val, N score" line rather than assuming a fixed count.
+# Validation stays flood-free, so residual median/std/POT thresholds are calibrated on pure-normal
+# data; score then contains both the flood window itself and the normal timesteps surrounding it in
+# those same sessions, so true/false-positive flood detection (root_cause_analysis's AC@k, computed
+# automatically below since --flood-events-csv is set) has both positive and negative samples to work
+# with. See cuts_plus_rca.py's flood_aware_split config field.
 #
-# flood_events_output/events.csv + station_events.csv must already exist - build them once with:
+# flood_events_output/municipality_high/events.csv + station_events.csv must already exist - build
+# them once with:
 #   python3 cuts_plus_prototype/prepare_rws_waterinfo.py --input-dir rws_waterinfo --output-dir /tmp/wl_adapted
-#   python3 flood_events.py --data-dir /tmp/wl_adapted --out flood_events_output
-# (national tables, not Limburg-specific - the same ones run_rws_waterinfo_pipeline.sh uses; a station's
-# event still routes the whole dataset's session for that window, per flood_events.py's own convention
-# that a flood is a regime shift felt by every channel, not just the station(s) that triggered it.
-# flood_events.py needs an occluded directory, not the raw rws_waterinfo/ - this is a small, one-off,
-# infrequently-rebuilt artifact, so a scratch adapted copy built just for this is fine; it doesn't need
-# to be the Limburg dataset build below, which is water-level-only and region-filtered separately).
+#   python3 flood_events_municipality.py --data-dir /tmp/wl_adapted --out flood_events_output
+# (national/municipality tables, not Limburg-specific - the same ones run_rws_waterinfo_pipeline.sh
+# uses; a station's event still routes the whole dataset's session for that window, per
+# flood_events.py's own convention that a flood is a regime shift felt by every channel, not just the
+# station(s) that triggered it. This is the municipality_high/ table (alert=="high" only, filtered from
+# flood_events_municipality.py's 408-station detection) rather than flood_events.py's original
+# 11-station events.csv - confirmed this session that lower alert thresholds on the full
+# municipality-level table cover an implausibly large fraction of the whole dataset (27.8% at medium+,
+# 100% at low+), so only "high" is usable here. The occluded directory needs to be built once, as
+# above - this is a small, infrequently-rebuilt artifact, so a scratch adapted copy built just for this
+# is fine; it doesn't need to be the Limburg dataset build below, which is water-level-only and
+# region-filtered separately).
 #
 # --region limburg below is built on the fly by build_dataset.sh (water level only, matching the
 # `1974`/`imputation`/sweep_fill_policy.sh runs this eval was built to extend).
@@ -41,15 +47,16 @@
 #
 #   total_epoch         default 50 (matches the fill_policy sweep runs)
 #   predict_chunk_size  default 32 (lower this if validation/scoring runs out of memory)
-#   flood_min_alert      default medium (low/medium/high - which flood_events.py alerts route to score)
+#   flood_min_alert      default high (the municipality_high/ table only ever has "high" rows, so
+#                        medium/low would trivially select everything anyway)
 set -euo pipefail
 
 TOTAL_EPOCH="${1:-50}"
 PREDICT_CHUNK_SIZE="${2:-32}"
-FLOOD_MIN_ALERT="${3:-medium}"
+FLOOD_MIN_ALERT="${3:-high}"
 
 DATA_DIR=cuts_plus_prototype/scratch/limburg_flood_eval_dataset
-FLOOD_EVENTS_CSV=flood_events_output/events.csv
+FLOOD_EVENTS_CSV=flood_events_output/municipality_high/events.csv
 FILL_POLICY=rate_0.1_after_10
 LAMBDA_S_START=0.3
 LAMBDA_S_END=0.03
@@ -62,7 +69,7 @@ RUN_DIR=cuts_plus_prototype/scratch/limburg_flood_eval
 if [ ! -f "$FLOOD_EVENTS_CSV" ]; then
   echo "$FLOOD_EVENTS_CSV not found - build it first with:"
   echo "  python3 cuts_plus_prototype/prepare_rws_waterinfo.py --input-dir rws_waterinfo --output-dir /tmp/wl_adapted"
-  echo "  python3 flood_events.py --data-dir /tmp/wl_adapted --out flood_events_output"
+  echo "  python3 flood_events_municipality.py --data-dir /tmp/wl_adapted --out flood_events_output"
   exit 1
 fi
 

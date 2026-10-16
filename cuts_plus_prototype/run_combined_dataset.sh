@@ -10,9 +10,12 @@
 #      prepare_rws_waterinfo.py -> combine_rws_knmi.py -> prepare_data.py without keeping any of their
 #      intermediate output as its own permanently-named directory (rain needs no occlusion - nothing
 #      in this pipeline occludes it, only prefixes it at download time)
-#   4. build flood_events_output/events.csv (flood_events.py) if not already there - used by
-#      cuts_plus_rca.py's --flood-events-csv (training step, not run here) to mask flood windows out
-#      of train/val only and evaluate root-cause ranking against them on held-out sessions
+#   4. build flood_events_output/municipality_high/events.csv (flood_events_municipality.py, 408
+#      open-water stations joined to their own municipality, filtered to alert=="high" - lower
+#      thresholds cover an implausibly large fraction of the whole dataset, confirmed this session)
+#      if not already there - used by cuts_plus_rca.py's --flood-events-csv (training step, not run
+#      here) to mask flood windows out of train/val only and evaluate root-cause ranking against them
+#      on held-out sessions
 #
 # No drop-sparse-channels stage: that's handled at train time by cuts_plus_rca.py's
 # --min-channel-availability, computed from the actual training split.
@@ -39,7 +42,7 @@
 set -euo pipefail
 
 MIN_AVAILABILITY="${1:-0.10}"
-FLOOD_MIN_ALERT="${2:-medium}"
+FLOOD_MIN_ALERT="${2:-high}"
 
 if [ -x .venv-rws/bin/python ]; then PY=.venv-rws/bin/python; else PY=python3; fi
 
@@ -66,13 +69,13 @@ fi
 echo "=== 3/4: building the combined dataset -> $PREPARED ==="
 cuts_plus_prototype/build_dataset.sh "$PREPARED" "" "$WL_RAW" "$Q_RAW" "$RAIN_RAW"
 
-FLOOD_EVENTS_CSV=flood_events_output/events.csv
+FLOOD_EVENTS_CSV=flood_events_output/municipality_high/events.csv
 if [ ! -f "$FLOOD_EVENTS_CSV" ]; then
-  echo "=== 4/4: building the flood events table -> $FLOOD_EVENTS_CSV ==="
+  echo "=== 4/4: building the municipality-level flood events table -> $FLOOD_EVENTS_CSV ==="
   WL_ADAPTED="$(mktemp -d)"
   trap 'rm -rf "$WL_ADAPTED"' EXIT
   "$PY" cuts_plus_prototype/prepare_rws_waterinfo.py --input-dir "$WL_RAW" --output-dir "$WL_ADAPTED"
-  "$PY" flood_events.py --data-dir "$WL_ADAPTED" --out flood_events_output
+  "$PY" flood_events_municipality.py --data-dir "$WL_ADAPTED" --out flood_events_output
 else
   echo "=== 4/4: $FLOOD_EVENTS_CSV already exists, skipping ==="
 fi

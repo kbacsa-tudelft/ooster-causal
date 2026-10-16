@@ -14,7 +14,8 @@
 #   predict_chunk_size  default 32 (lower this if validation/scoring runs out of memory)
 #   min_availability    default 0.10 (channels observed in fewer training rows than this are dropped at
 #                        train time via cuts_plus_rca.py's --min-channel-availability)
-#   flood_min_alert      default medium (low/medium/high - which flood_events.py alerts to use)
+#   flood_min_alert      default high (the municipality_high/ table only ever has "high" rows, so
+#                        medium/low would trivially select everything anyway - see step 2's comment)
 #
 # Fixed settings (edit here):
 #   LAMBDA_S_START/END  sparsity penalty on the graph, 3x the CUTS+ default (0.1 -> 0.01)
@@ -25,7 +26,7 @@ set -euo pipefail
 TOTAL_EPOCH="${1:-2}"
 PREDICT_CHUNK_SIZE="${2:-32}"
 MIN_AVAILABILITY="${3:-0.10}"
-FLOOD_MIN_ALERT="${4:-medium}"
+FLOOD_MIN_ALERT="${4:-high}"
 
 LAMBDA_S_START=0.3
 LAMBDA_S_END=0.03
@@ -39,12 +40,18 @@ PREPARED_DIR="$RUN_DIR/dataset"
 echo "=== 1/6: building the trainable dataset $RAW_DIR -> $PREPARED_DIR ==="
 cuts_plus_prototype/build_dataset.sh "$PREPARED_DIR" "" "$RAW_DIR" "" ""
 
-FLOOD_EVENTS_CSV=flood_events_output/events.csv
+# flood_events_municipality.py (408 open-water stations joined to their own municipality, not just
+# flood_events.py's original 11) - filtered to alert=="high" only, since lower thresholds on the full
+# municipality-level table cover an implausibly large fraction of the whole dataset (confirmed this
+# session: 27.8% of all days at medium+, 100% at low+, vs. this high-only table's 6.8%). Takes ~90
+# minutes the first time (408 stations vs. 11) - paid once, same as the guard below already does for
+# the original flood_events.py call.
+FLOOD_EVENTS_CSV=flood_events_output/municipality_high/events.csv
 if [ ! -f "$FLOOD_EVENTS_CSV" ]; then
-  echo "=== 2/6: building the flood events table -> $FLOOD_EVENTS_CSV ==="
+  echo "=== 2/6: building the municipality-level flood events table -> $FLOOD_EVENTS_CSV ==="
   WL_ADAPTED="$RUN_DIR/wl_adapted_for_flood_events"
   python3 cuts_plus_prototype/prepare_rws_waterinfo.py --input-dir "$RAW_DIR" --output-dir "$WL_ADAPTED"
-  python3 flood_events.py --data-dir "$WL_ADAPTED" --out flood_events_output
+  python3 flood_events_municipality.py --data-dir "$WL_ADAPTED" --out flood_events_output
   rm -rf "$WL_ADAPTED"
 else
   echo "=== 2/6: $FLOOD_EVENTS_CSV already exists, skipping ==="

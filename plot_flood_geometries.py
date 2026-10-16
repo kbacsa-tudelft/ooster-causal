@@ -1,32 +1,26 @@
 """
-Renders build_flood_geometries.py's output (flood_events_output/flood_events.geojson) as an interactive
-map - the "viz first" deliverable for inspecting whether the synthesized flood extents look plausible.
+Renders build_municipality_flood_geometries.py's output
+(flood_events_output/municipality_flood_events.geojson) as an interactive map - one real municipality
+polygon per flood_events_municipality.py-detected event, no approximation: each feature's geometry is
+already that event's own real municipality (a direct municipality_code lookup), not a guess.
 
-Fill color is keyed by --color-by (alert low/medium/high, or type storm surge/river high water);
-stroke style is keyed by extent_source (solid = digitized, a real ROR polygon; dashed =
-derived_municipalities, a synthesized union of real municipality polygons) so approximations are
-visually distinguishable from the real thing.
+Fill/marker color is keyed by alert (low/medium/high) - there is no "type" (storm surge/river high
+water) in this schema, since flood_events_municipality.py's municipality-scoped merge can mix coastal
+and river stations within one municipality (see flood_events.merge_national()'s group_col="kind" vs.
+group_col="municipality_code" paths).
 
 Events are grouped into one toggleable layer per decade (via folium's native LayerControl, top right
 of the map) - all decades are shown by default, un-check any to filter them out interactively without
 regenerating the map.
 
-Default --geometry is "first_municipality": the --top-n-municipalities (default 5) municipalities
-(from --municipalities, default the current 2024 map) nearest the *weighted centroid* of every station that
-crossed its own threshold for that event - not just the event's single worst_station. events.csv only
-keeps the one worst-performing gauge per national event, but station_events.csv still has every
-individual station involved (47% of events - 126/267 - actually involve 2-6 distinct stations at
-once). E.g. the 1953 storm surge's Vlissingen 453 (high), Hoek van Holland 381 (high), Dordrecht 370
-(high), Harlingen 365 (medium), Den Helder 322 (medium) are combined via
-flood_geometry.weighted_centroid_lonlat() into one point pulled toward Vlissingen (the highest weight)
-without discarding the other four, then flood_geometry.nearest_municipalities() takes the 5 closest
-municipalities to that point (not just the 1 containing it) and unions them - a small cluster around
-the weighted centroid rather than a single sliver. --geometry extent plots the full synthesized
-municipality-union instead (much more overlap, since it's severity-scaled and can span dozens of
-municipalities); --geometry point plots a marker sized by severity instead of any shape at all.
+Default --geometry is "extent": the real municipality polygon. Many events genuinely do overlap
+(multiple historical events hit the same municipality over the decades) - that's real data, not an
+approximation artifact, so low fillOpacity/thin strokes keep overlapping shapes legible by stacking
+darker rather than one occluding the rest. --geometry point plots a marker at the municipality's own
+centroid instead (sized by alert), for a quick decluttered view.
 
 Usage:
-    python3 plot_flood_geometries.py --geojson flood_events_output/flood_events.geojson \
+    python3 plot_flood_geometries.py --geojson flood_events_output/municipality_flood_events.geojson \
         --output flood_events_output/flood_map.html
 """
 import argparse
@@ -35,25 +29,19 @@ import json
 import folium
 import pandas as pd
 from shapely.geometry import mapping, shape
-from shapely.ops import unary_union
 
-import flood_geometry as fg
 from flood_events import DEFAULT_STATIONS
 
-COLOR_PALETTES = {
-    "alert": {"low": "#2ecc71", "medium": "#f39c12", "high": "#e74c3c"},
-    "type": {"storm surge": "#3498db", "river high water": "#8e44ad"},
-}
+ALERT_COLOR = {"low": "#2ecc71", "medium": "#f39c12", "high": "#e74c3c"}
+ALERT_RADIUS = {"low": 5, "medium": 9, "high": 14}
 TILES_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"
 TILES_ATTR = "Esri, HERE, Garmin, FAO, NOAA, USGS, © OpenStreetMap contributors, and the GIS User Community"
 
-TOOLTIP_FIELDS = ["peak_date", "type", "alert", "worst_station", "extent_source", "matched_nr",
-                   "severity_fraction"]
-# affected_municipalities (events.csv's own severity-scaled union, can be dozens of names for a
-# derived_municipalities row) is deliberately excluded - takes up far too much tooltip space and
-# isn't what --geometry first_municipality even shows; first_municipality (added separately below,
-# already capped at --top-n-municipalities) is the relevant municipality list to display instead.
-# Long text still wraps rather than running off the tooltip, in case any remaining field is long.
+TOOLTIP_FIELDS = ["peak_date", "alert", "municipality_naam", "worst_station", "worst_detail",
+                   "worst_level_cm_nap", "stations"]
+# Long fields (stations especially, which lists every contributing station) otherwise render as one
+# unbroken line that runs off the visible tooltip - force wrapping and cap the width so it reads as a
+# readable block instead.
 TOOLTIP_STYLE = "white-space: normal; word-wrap: break-word; max-width: 420px; font-size: 13px;"
 
 
@@ -62,114 +50,64 @@ def decade_label(peak_date: str) -> str:
     return f"{(year // 10) * 10}s"
 
 
-def make_style_function(color_by: str):
-    palette = COLOR_PALETTES[color_by]
-
-    def style_function(feature: dict) -> dict:
-        props = feature["properties"]
-        return {
-            "fillColor": palette.get(props.get(color_by), "#95a5a6"),
-            "color": "#2c3e50",
-            "weight": 1.5,
-            "dashArray": None if props.get("extent_source") == "digitized" else "6,4",
-            # Low opacity so heavily-overlapping shapes (many events share the same handful of anchor
-            # stations - see module docstring) build up darker where they stack, rather than one
-            # fully occluding the others underneath it.
-            "fillOpacity": 0.2,
-        }
-    return style_function
+def style_function(feature: dict) -> dict:
+    alert = feature["properties"].get("alert")
+    return {
+        "fillColor": ALERT_COLOR.get(alert, "#95a5a6"),
+        "color": "#2c3e50",
+        "weight": 1.5,
+        # Low opacity so heavily-overlapping shapes (the same municipality can have several events
+        # across the decades) build up darker where they stack, rather than one fully occluding the
+        # others underneath it.
+        "fillOpacity": 0.2,
+    }
 
 
-MIN_RADIUS, MAX_RADIUS = 5, 20
-
-
-def anchor_marker(feature: dict, locations, name_to_code: dict, color_by: str) -> folium.CircleMarker:
+def point_marker(feature: dict) -> folium.CircleMarker:
     props = feature["properties"]
-    code = name_to_code[props["worst_station"]]
-    lon, lat = fg.station_lonlat(code, locations)
-    radius = MIN_RADIUS + (MAX_RADIUS - MIN_RADIUS) * props["severity_fraction"]
-    palette = COLOR_PALETTES[color_by]
+    centroid = shape(feature["geometry"]).centroid
     tooltip_rows = "".join(f"<b>{field}</b>: {props[field]}<br>" for field in TOOLTIP_FIELDS
                             if field in props)
     return folium.CircleMarker(
-        location=[lat, lon], radius=radius,
-        color="#2c3e50", weight=1 if props.get("extent_source") == "digitized" else 0.5,
-        dash_array=None if props.get("extent_source") == "digitized" else "4,3",
-        fill=True, fill_color=palette.get(props.get(color_by), "#95a5a6"), fill_opacity=0.6,
+        location=[centroid.y, centroid.x], radius=ALERT_RADIUS.get(props.get("alert"), 5),
+        color="#2c3e50", weight=1, fill=True,
+        fill_color=ALERT_COLOR.get(props.get("alert"), "#95a5a6"), fill_opacity=0.6,
         tooltip=folium.Tooltip(tooltip_rows, style=TOOLTIP_STYLE),
     )
 
 
-def contributing_station_weights(feature: dict, station_events: pd.DataFrame) -> dict:
-    """{code: peak_level} for every station that crossed its own threshold within this event's window
-    - the same (kind, peak_time-in-[start, end]) grouping flood_events.py's own merge_national() uses
-    internally, just not persisted back onto events.csv as anything beyond the single worst station."""
-    props = feature["properties"]
-    kind = "coast" if props["type"] == "storm surge" else "river"
-    start = pd.Timestamp(props["start"])
-    end = pd.Timestamp(props["end"]) + pd.Timedelta(days=1)
-    window = station_events[(station_events["kind"] == kind) &
-                             (station_events["peak_time"] >= start) &
-                             (station_events["peak_time"] <= end)]
-    weights = window.groupby("code")["peak_level"].max().to_dict()
-    if weights:
-        return weights
-    # Shouldn't happen (the worst_station itself always falls inside its own event's window), but
-    # fall back to just that one station rather than crashing on an unexpected edge case.
-    code = fg.station_name_to_code()[props["worst_station"]]
-    return {code: props["worst_level_cm_nap"]}
-
-
-def legend_html(color_by: str) -> str:
+def legend_html() -> str:
     rows = "".join(
         f'<div><span style="background:{color};width:12px;height:12px;display:inline-block;'
         f'margin-right:6px;"></span>{label}</div>'
-        for label, color in COLOR_PALETTES[color_by].items()
+        for label, color in ALERT_COLOR.items()
     )
     return (
         '<div style="position:fixed;bottom:20px;left:20px;z-index:9999;background:white;'
         'padding:8px 12px;border:1px solid #2c3e50;border-radius:4px;font-size:13px;">'
-        f'<b>{color_by}</b>{rows}</div>'
+        f'<b>alert</b>{rows}</div>'
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--geojson", default="flood_events_output/flood_events.geojson")
+    parser.add_argument("--geojson", default="flood_events_output/municipality_flood_events.geojson")
     parser.add_argument("--locations-csv", default="rws_waterinfo/locations.csv")
     parser.add_argument("--output", default="flood_events_output/flood_map.html")
-    parser.add_argument("--color-by", choices=["alert", "type"], default="alert",
-                         help="which property to color polygon fills by")
-    parser.add_argument("--geometry", choices=["first_municipality", "extent", "point"],
-                         default="first_municipality",
-                         help="'first_municipality': the --top-n-municipalities nearest each event's "
-                              "weighted anchor - a real shape, minimal overlap. 'extent': the full "
-                              "severity-scaled synthesized union (much more overlap). 'point': a "
-                              "marker sized by severity, no shape at all.")
-    parser.add_argument("--municipalities", default="reference_data/municipalities_2024.geojson",
-                         help="municipality set --geometry first_municipality picks from")
-    parser.add_argument("--top-n-municipalities", type=int, default=5,
-                         help="how many of the nearest municipalities to the weighted anchor to show "
-                              "per event, for --geometry first_municipality")
-    parser.add_argument("--station-events-csv", default="flood_events_output/station_events.csv",
-                         help="used by --geometry first_municipality to find every station "
-                              "contributing to an event, not just its single worst_station")
+    parser.add_argument("--geometry", choices=["extent", "point"], default="extent",
+                         help="'extent': the real municipality polygon. 'point': a marker at the "
+                              "municipality's own centroid, sized by alert - a quick decluttered view.")
     parser.add_argument("--netherlands-border", default="reference_data/netherlands_border.geojson",
                          help="country outline drawn for geographic context - pass '' to skip it "
                               "(see fetch_netherlands_border.py)")
     parser.add_argument("--only-alert", choices=["low", "medium", "high"],
                          help="only plot events at this alert level")
-    parser.add_argument("--only-source", choices=["digitized", "derived_municipalities"],
-                         help="only plot events with this extent_source")
     parser.add_argument("--simplify-deg", type=float, default=0.002,
                          help="shapely simplify() tolerance in degrees (~200m), applied to this map's "
-                              "rendering only - a derived_municipalities shape is a union of several "
-                              "already-detailed municipality polygons, so plotting all 267 events "
-                              "unsimplified produces an unusably large/slow HTML file. The underlying "
-                              "flood_events.geojson this reads from is never modified. Plotting all "
-                              "267 events at once is still a large (~20MB), slow-loading file even "
-                              "simplified - use --only-alert/--only-source to cut it down for "
-                              "practical browsing (e.g. --only-alert high is ~200 vertices total).")
+                              "rendering only - plotting all 5531 events unsimplified produces a very "
+                              "large/slow HTML file. The underlying municipality_flood_events.geojson "
+                              "this reads from is never modified - use --only-alert to cut the map "
+                              "down for practical browsing (e.g. --only-alert high is ~100 events).")
     args = parser.parse_args()
 
     with open(args.geojson) as f:
@@ -177,10 +115,8 @@ def main():
     features = collection["features"]
     if args.only_alert:
         features = [f for f in features if f["properties"]["alert"] == args.only_alert]
-    if args.only_source:
-        features = [f for f in features if f["properties"]["extent_source"] == args.only_source]
     if not features:
-        raise ValueError("No features left to plot after applying --only-alert/--only-source")
+        raise ValueError("No features left to plot after applying --only-alert")
 
     locations = pd.read_csv(args.locations_csv, index_col="name")
     center_lat, center_lon = float(locations["lat"].mean()), float(locations["lon"].mean())
@@ -194,63 +130,30 @@ def main():
             style_function=lambda _: {"fillOpacity": 0, "color": "#2c3e50", "weight": 2},
         ).add_to(m)
 
-    style_function = make_style_function(args.color_by)
-    name_to_code = fg.station_name_to_code()
-    if args.geometry == "first_municipality":
-        with open(args.municipalities) as f:
-            municipalities = json.load(f)["features"]
-        station_events = pd.read_csv(args.station_events_csv)
-        station_events["peak_time"] = (pd.to_datetime(station_events["peak_time"], utc=True)
-                                        .dt.tz_localize(None))
-        # Events with the exact same contributing-station weights (most commonly: the 140/267 events
-        # that only ever involved one station at all) always resolve to the same municipality - cache
-        # it rather than re-scanning the whole municipality list for every one of the 267 events.
-        municipality_cache = {}
-
     decade_groups = {}
     for feature in features:
         decade = decade_label(feature["properties"]["peak_date"])
         group = decade_groups.setdefault(decade, folium.FeatureGroup(name=decade, show=True))
 
         if args.geometry == "point":
-            anchor_marker(feature, locations, name_to_code, args.color_by).add_to(group)
+            point_marker(feature).add_to(group)
         else:
-            if args.geometry == "first_municipality":
-                weights = contributing_station_weights(feature, station_events)
-                cache_key = tuple(sorted(weights.items()))
-                if cache_key not in municipality_cache:
-                    centroid_lonlat = fg.weighted_centroid_lonlat(weights, locations)
-                    top_n = fg.nearest_municipalities(centroid_lonlat, municipalities,
-                                                       n=args.top_n_municipalities)
-                    geometry = top_n[0]["geometry"] if len(top_n) == 1 else mapping(
-                        unary_union([shape(m["geometry"]) for m in top_n]))
-                    names = [m["properties"]["naam"] for m in top_n]
-                    municipality_cache[cache_key] = (geometry, names)
-                geometry, names = municipality_cache[cache_key]
-                render_feature = {"type": "Feature", "properties": dict(feature["properties"]),
-                                   "geometry": geometry}
-                render_feature["properties"]["first_municipality"] = ", ".join(names)
-                render_feature["properties"]["n_contributing_stations"] = len(weights)
-            else:
-                render_feature = feature
-
-            simplified = dict(render_feature)
-            simplified["geometry"] = mapping(shape(render_feature["geometry"]).simplify(
+            simplified = dict(feature)
+            simplified["geometry"] = mapping(shape(feature["geometry"]).simplify(
                 args.simplify_deg, preserve_topology=True))
             folium.GeoJson(
                 simplified,
                 style_function=style_function,
                 tooltip=folium.GeoJsonTooltip(
-                    fields=[f for f in TOOLTIP_FIELDS + ["first_municipality", "n_contributing_stations"]
-                            if f in simplified["properties"]],
+                    fields=[f for f in TOOLTIP_FIELDS if f in simplified["properties"]],
                     style=TOOLTIP_STYLE),
             ).add_to(group)
     for decade in sorted(decade_groups):
         decade_groups[decade].add_to(m)
     folium.LayerControl(collapsed=False).add_to(m)
-    m.get_root().html.add_child(folium.Element(legend_html(args.color_by)))
+    m.get_root().html.add_child(folium.Element(legend_html()))
 
-    # Overlay the 11 gauge stations for grounding.
+    # Overlay the 11 original flood_events.py gauge stations for grounding.
     for stations in DEFAULT_STATIONS.values():
         for code, name in stations:
             if code in locations.index:
@@ -259,9 +162,7 @@ def main():
                                     fill=True, fill_opacity=1.0, tooltip=name).add_to(m)
 
     m.save(args.output)
-    n_digitized = sum(1 for f in features if f["properties"]["extent_source"] == "digitized")
-    print(f"Wrote {args.output}: {len(features)} feature(s) "
-          f"({n_digitized} digitized, {len(features) - n_digitized} derived)")
+    print(f"Wrote {args.output}: {len(features)} feature(s)")
 
 
 if __name__ == "__main__":

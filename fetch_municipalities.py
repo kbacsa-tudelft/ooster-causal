@@ -1,29 +1,23 @@
 """
-Fetches Dutch municipality boundaries for a given year from NLGis (Zijdeman & Mac Gillavry,
-DataverseNL, DOI 10.34894/4G2NJM, CC-BY-SA-4.0) - yearly boundary files covering 1812-2020, each a
-public GeoJSON download with no account/login required (confirmed directly). Trims to the
-municipalities near the 6 candidate ROR historical flood events and the 11 flood_events.py gauge
-stations, and writes a small, committed reference GeoJSON file.
+Fetches Dutch municipality boundaries and writes a small, committed reference GeoJSON file.
 
-Historical boundaries matter here because the Netherlands has steadily merged municipalities for
-efficiency - 342 today vs. 1,249 in 1820 (confirmed the national maximum across the dataset, by
-sampling feature counts year by year) and 1,014 in 1953 alone - so fetching whichever year is actually
-relevant gives far finer granularity for the flood-geometry synthesis than today's boundaries would:
-  - Each of the 6 candidate ROR events' own reach profile (flood_geometry.learn_reach_profile) uses
-    that event's own year (1916/1926/1953/1993/1995), for historically accurate measurement.
-  - Every synthesized (non-template) event uses year 1820, the single most granular map available,
-    uniformly - per the user's explicit choice, visualization granularity matters more here than using
-    each event's own (less detailed) contemporary boundaries.
+**Currently used**: `--source pdok --national` fetches today's current-day boundaries from
+PDOK/Kadaster (CC BY 4.0, no auth) with no trimming - this is what flood_events_municipality.py needs
+to join its 408 stations (scattered anywhere in the country) to their real municipality, and what
+build_municipality_flood_geometries.py reads for the map (reference_data/
+municipalities_2024_national.geojson).
+
+**Legacy, currently unused**: `--source nlgis --year <1812-2020>` fetches a historical year from NLGis
+(Zijdeman & Mac Gillavry, DataverseNL, DOI 10.34894/4G2NJM, CC-BY-SA-4.0) and trims it to the 6
+candidate ROR historical flood events + 11 flood_events.py gauge stations (--national skips this trim
+too). This was for build_flood_geometries.py's reach-profile-synthesis approach to the map, retired
+once flood_events_municipality.py's real municipality joins made it unnecessary - left in place
+(unlike build_flood_geometries.py itself, which was deleted) since removing it wasn't asked for, but
+nothing in the active pipeline calls it anymore.
 
 Unlike every other output in this project, these files are meant to be committed: they're static
 long-term reference geography, not a per-run generated artifact, and committing them avoids a live
-network dependency for every future flood-geometry run. Rerun this script only if NLGis's data updates
-or the set of ROR source events changes.
-
---source pdok fetches today's current-day boundaries from PDOK/Kadaster instead (CC BY 4.0, no auth) -
-NLGis's own coverage stops at 2020. Combined with --national (skip the ROR/station trim entirely and
-keep every municipality nationwide), this is what flood_events_municipality.py needs to join stations
-scattered anywhere in the country, not just near the 6 historical flood events used for the map.
+network dependency for every future run.
 
 Usage:
     python3 fetch_municipalities.py --year 1820 --out reference_data/municipalities_1820.geojson
