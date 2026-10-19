@@ -12,7 +12,7 @@
 # cuts_plus_rca.py's --min-channel-availability, computed from the actual training split.
 #
 # Usage:
-#   cuts_plus_prototype/build_dataset.sh OUTPUT_DIR [REGION] [WL_DIR] [Q_DIR] [RAIN_DIR] [RESAMPLE_FREQ] [START]
+#   cuts_plus_prototype/build_dataset.sh OUTPUT_DIR [REGION] [WL_DIR] [Q_DIR] [RAIN_DIR] [RESAMPLE_FREQ] [START] [RAIN_WINDOW]
 #
 #   OUTPUT_DIR     required - where the final trainable dataset lands (overwritten if it exists)
 #   REGION         'zeeland' | 'limburg' | '' (default '', no region filtering)
@@ -28,6 +28,9 @@
 #                  is this project's own established cutoff (matches the historical
 #                  rws_waterinfo_prepared_1974/rws_waterinfo_limburg/rws_waterinfo_zeeland directories'
 #                  session count exactly - 1330 sessions). Pass '' to disable (keep every session).
+#   RAIN_WINDOW    default '' (no rolling-sum accumulation); forwarded to prepare_data.py --rain-window
+#                  (e.g. '24h') when non-empty - replaces each RH_* channel with its own rolling sum
+#                  over that window before normalization. Ignored when RAIN_DIR is ''.
 #
 #   Water-level-only: pass '' for both Q_DIR and RAIN_DIR - the merge stage is skipped entirely and
 #   water level is resampled/filtered directly.
@@ -44,6 +47,7 @@ Q_DIR="${4-rws_discharge}"
 RAIN_DIR="${5-knmi_rain}"
 RESAMPLE_FREQ="${6:-auto}"
 START="${7-1974-01-01}"
+RAIN_WINDOW="${8-}"
 
 declare -A REGION_BBOX=(
   [zeeland]="51.20 51.78 3.30 4.30"
@@ -94,6 +98,9 @@ echo "=== Resampling -> staging (freq=$RESAMPLE_FREQ, start=${START:-<none>}) ==
 PREPARE_DATA_ARGS=(--input-dir "$PREPARE_INPUT" --output-dir "$STAGE/prepared" --freq "$RESAMPLE_FREQ")
 if [ -n "$START" ]; then
   PREPARE_DATA_ARGS+=(--start "$START")
+fi
+if [ -n "$RAIN_DIR" ] && [ -n "$RAIN_WINDOW" ]; then
+  PREPARE_DATA_ARGS+=(--rain-window "$RAIN_WINDOW")
 fi
 python3 cuts_plus_prototype/prepare_data.py "${PREPARE_DATA_ARGS[@]}"
 
