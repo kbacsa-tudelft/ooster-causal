@@ -6,8 +6,11 @@ estuary Zeeland coast) from the full rws_waterinfo_prepared_1974 dataset - see s
 which sweeps --fill-policy across one or more such subsets.
 
 A channel column (e.g. "WL_borgharen.beneden") is matched to locations.csv's `name` column by
-stripping its WL_/Q_/RH_ prefix. A channel whose station isn't in locations.csv is dropped with a
-warning (shouldn't happen for this pipeline's own output, but checked defensively rather than assumed).
+stripping its WL_/Q_ prefix. RH_* (rainfall) channels are matched by their full name instead - KNMI
+locations.csv stores rain stations under their full prefixed channel name (e.g. "RH_VALKENBURG_210"),
+not the bare station code (see download_knmi_rain.py / plot_causal_map.py's load_locations, which rely
+on the same convention). A channel whose station isn't in locations.csv is dropped with a warning
+(shouldn't happen for this pipeline's own output, but checked defensively rather than assumed).
 
 Usage:
     python3 cuts_plus_prototype/filter_by_region.py --input-dir rws_waterinfo_prepared_1974 \
@@ -22,10 +25,12 @@ import re
 
 import pandas as pd
 
-CHANNEL_PREFIX_RE = re.compile(r'^(WL|Q|RH)_')
+CHANNEL_PREFIX_RE = re.compile(r'^(WL|Q)_')
 
 
 def station_of(channel: str) -> str:
+    if channel.startswith('RH_'):
+        return channel
     return CHANNEL_PREFIX_RE.sub('', channel)
 
 
