@@ -5,13 +5,23 @@
 # so the two runs can be compared directly with compare_fill_policies.py.
 #
 # Run from the repo root:
-#   cuts_plus_prototype/run_zeeland_rain_experiment.sh
+#   cuts_plus_prototype/run_zeeland_rain_experiment.sh [RAIN_WINDOW]
+#
+#   RAIN_WINDOW  default '24h'; pass e.g. '3h' to accumulate rain over a shorter window instead.
+#                The default window keeps its original unsuffixed output dirs
+#                (convergence_sweep_zeeland_rain, convergence_dataset_zeeland_rain) for backward
+#                compatibility; any other window gets its own _<window>-suffixed dirs so multiple
+#                windows' results can coexist and be compared.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-RAIN_WINDOW=24h
-DATASET_DIR=cuts_plus_prototype/scratch/convergence_dataset_zeeland_rain
-RUN_DIR=convergence_sweep_zeeland_rain/sparsity_fine_08
+RAIN_WINDOW="${1:-24h}"
+SUFFIX=""
+if [ "$RAIN_WINDOW" != "24h" ]; then
+  SUFFIX="_$RAIN_WINDOW"
+fi
+DATASET_DIR="cuts_plus_prototype/scratch/convergence_dataset_zeeland_rain${SUFFIX}"
+RUN_DIR="convergence_sweep_zeeland_rain${SUFFIX}/sparsity_fine_08"
 
 echo "=== Step 1/4: rain data ==="
 if [ ! -d knmi_rain ]; then
@@ -55,4 +65,4 @@ python3 cuts_plus_prototype/cuts_plus_rca.py --data-dir "$DATASET_DIR" \
 
 echo "Done. Compare against the water-level-only run with:"
 echo "  python3 cuts_plus_prototype/compare_fill_policies.py --sweep-root convergence_sweep_zeeland"
-echo "  python3 cuts_plus_prototype/compare_fill_policies.py --sweep-root convergence_sweep_zeeland_rain"
+echo "  python3 cuts_plus_prototype/compare_fill_policies.py --sweep-root convergence_sweep_zeeland_rain${SUFFIX}"
