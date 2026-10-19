@@ -13,7 +13,7 @@ RAIN_WINDOW=24h
 DATASET_DIR=cuts_plus_prototype/scratch/convergence_dataset_zeeland_rain
 RUN_DIR=convergence_sweep_zeeland_rain/sparsity_fine_08
 
-echo "=== Step 1/3: rain data ==="
+echo "=== Step 1/4: rain data ==="
 if [ ! -d knmi_rain ]; then
   if [ -d download_package/knmi_rain ]; then
     echo "Copying download_package/knmi_rain -> knmi_rain"
@@ -26,10 +26,27 @@ else
   echo "knmi_rain/ already present, reusing it."
 fi
 
-echo "=== Step 2/3: build the Zeeland+rain dataset (rain-window=$RAIN_WINDOW) ==="
+N_RAIN_SESSIONS="$(find -L knmi_rain/sessions -name '*.parquet' 2>/dev/null | wc -l)"
+if [ "$N_RAIN_SESSIONS" -eq 0 ]; then
+  echo "knmi_rain/sessions has no .parquet files (broken symlink, or empty/incomplete copy) - fix before rerunning." >&2
+  exit 1
+fi
+echo "knmi_rain/sessions: $N_RAIN_SESSIONS session file(s) found."
+
+echo "=== Step 2/4: build the Zeeland+rain dataset (rain-window=$RAIN_WINDOW) ==="
 cuts_plus_prototype/build_dataset.sh "$DATASET_DIR" zeeland rws_waterinfo "" knmi_rain auto 1974-01-01 "$RAIN_WINDOW"
 
-echo "=== Step 3/3: train sparsity_fine_08 against it ==="
+echo "=== Step 3/4: verify rain channels made it into the built dataset ==="
+N_RAIN_CHANNELS="$(grep -o '"RH_[^"]*"' "$DATASET_DIR/normalization_stats.json" | sort -u | wc -l)"
+if [ "$N_RAIN_CHANNELS" -eq 0 ]; then
+  echo "Built dataset has zero RH_* channels in $DATASET_DIR/normalization_stats.json - rain never" >&2
+  echo "reached the dataset (check knmi_rain/locations.csv station coords fall inside the Zeeland bbox," >&2
+  echo "and that combine_rws_knmi.py actually found overlapping sessions). Aborting before training." >&2
+  exit 1
+fi
+echo "Found $N_RAIN_CHANNELS RH_* channel(s) in the built dataset."
+
+echo "=== Step 4/4: train sparsity_fine_08 against it ==="
 python3 cuts_plus_prototype/cuts_plus_rca.py --data-dir "$DATASET_DIR" \
   --total-epoch 50 --predict-chunk-size 32 --lambda-s-start 0.08 --lambda-s-end 0.08 --end-tau 1.0 \
   --fill-policy rate_0.1_after_10 --held-out-eval-every 2 \
