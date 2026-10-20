@@ -361,7 +361,11 @@ def topk_at_step(scores, labels, k_range=10):
     k_lst = []
     for i in range(len(labels)):
         if sum(labels[i]) > 0:
-            ranking = np.argsort(scores[i])
+            # np.argsort sorts NaN to the end (treated as the largest value), so a channel with no
+            # computable score (e.g. unobserved that session) would otherwise win the ranking outright
+            # regardless of any real channel's anomaly magnitude - replace with -inf so it can never win.
+            row = np.where(np.isnan(scores[i]), -np.inf, scores[i])
+            ranking = np.argsort(row)
             label_ind = np.where(labels[i] == 1)[0]
             for k in range(1, k_range + 1):
                 count = [1 if i in label_ind else 0 for i in ranking[-k:]]
