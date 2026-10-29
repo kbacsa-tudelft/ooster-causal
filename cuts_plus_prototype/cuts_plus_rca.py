@@ -266,6 +266,22 @@ def build_rain_exogeneity_mask(channel_names: list) -> np.ndarray:
     return mask
 
 
+def build_discharge_exogeneity_mask(channel_names: list) -> np.ndarray:
+    """(n_nodes, n_nodes) {0,1} matrix for MultiCAD.train()'s allowed_mask: forbids any non-discharge
+    channel ('Q_' prefix) from being discovered as a cause of a discharge channel - same exogeneity
+    rule as build_rain_exogeneity_mask, applied to discharge instead of rain: a river's discharge is
+    set by upstream hydrology (rainfall-runoff, dam/lock operation), not by the downstream water level
+    it's used to help predict, so water level can't be discovered as a cause of discharge. Discharge-
+    to-discharge, rain-to-discharge, and discharge-to-WL edges are left free to be discovered. Row =
+    cause, column = effect, matching MultiCAD's internal Graph convention (see
+    run_real_data_pipeline's `graph = graph.T` comment). Combine with build_rain_exogeneity_mask via
+    elementwise multiplication when both rain and discharge channels are present."""
+    is_discharge = np.array([c.startswith('Q_') for c in channel_names])
+    mask = np.ones((len(channel_names), len(channel_names)), dtype=np.float32)
+    mask[~is_discharge[:, None] & is_discharge[None, :]] = 0.0
+    return mask
+
+
 def concat_sessions(series_dict: dict, session_ids: list, boundary_gap: int):
     """Concatenates session DataFrames (in session_ids order) into one (T, N) array + an observ_mask
     that is 0 wherever the source data was NaN (real missing readings) and additionally 0 for the
@@ -844,7 +860,7 @@ def run_real_data_pipeline(config: CUTSPlusRCAConfig, log_dir_name: str = 'cuts_
 
     multicad = MultiCAD(opt, log, device=device)
     train_norm = normalize(train_data)
-    allowed_mask = build_rain_exogeneity_mask(channel_names)
+    allowed_mask = build_rain_exogeneity_mask(channel_names) * build_discharge_exogeneity_mask(channel_names)
     # true_cm=None (no ground truth) - so, unlike run_pipeline, the graph MultiCAD.train() returns is
     # NOT auto-transposed into "row=effect, col=cause" convention. Transpose it ourselves below.
     # checkpoint_path lives in save_dir, so rerunning the exact same command (same --save-dir) after an
