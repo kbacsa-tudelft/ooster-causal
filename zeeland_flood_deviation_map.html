@@ -16,7 +16,7 @@
     --grid: #e7ebee;
     --risk-low: 42, 120, 214;
     --risk-high: 227, 73, 72;
-    --tile-style: light_all;
+    --tile-style: World_Light_Gray_Base;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
@@ -29,7 +29,7 @@
       --grid: #232a32;
       --risk-low: 57, 135, 229;
       --risk-high: 230, 103, 103;
-      --tile-style: dark_all;
+      --tile-style: World_Dark_Gray_Base;
     }
   }
   :root[data-theme="dark"] {
@@ -42,7 +42,7 @@
     --grid: #232a32;
     --risk-low: 57, 135, 229;
     --risk-high: 230, 103, 103;
-    --tile-style: dark_all;
+    --tile-style: World_Dark_Gray_Base;
   }
   * { box-sizing: border-box; }
   body {
@@ -125,10 +125,12 @@
   The surface is a gaussian-kernel interpolation across the 40 gauges (of 77 total) with enough
   validation data to fit a threshold at all - the model only ever had Zeeland's own gauges to work
   with, so risk away from them is extrapolated, not measured. Event window (1976-01-03 14:00 →
-  1976-01-05 18:00) shown as a red band on the slider track. Basemap: OpenStreetMap map data, rendered
-  as tiles by CARTO (free, no key required) rather than loaded straight from osm.org's own tile
-  server - that server's usage policy is personal/low-volume use only and actively 403s embedded pages
-  like this one. A hand-assembled vector coastline (an earlier version of this page) kept producing
+  1976-01-05 18:00) shown as a red band on the slider track. Basemap: Esri's free World Light/Dark
+  Gray Base tiles (no key required) - osm.org's own tile server actively 403s embedded pages like this
+  one (its usage policy is personal/low-volume only), and CARTO's free anonymous tiles turned out to
+  need a key too, just rendered as an "API KEY REQUIRED" watermark baked into the tile image rather
+  than an HTTP error - both confirmed directly before landing on Esri. A hand-assembled vector
+  coastline (an earlier version of this page) kept producing
   small but real errors at specific spots (confirmed directly, e.g. a visibly wrong rounded edge near
   the Oosterscheldekering barrier traced straight back to upstream OSM coastline-way data, not a bug
   in the assembly), so this switched to real map tiles instead, trading the claude.ai artifact link's
@@ -157,13 +159,16 @@ const map = L.map('leaflet-map', { scrollWheelZoom: false });
 map.fitBounds([[DATA.view_bbox[1], DATA.view_bbox[0]], [DATA.view_bbox[3], DATA.view_bbox[2]]]);
 // osm.org's own tile server actively rejects this kind of embedded use (its tile usage policy is
 // personal/low-volume only, confirmed directly: 403 "App is not following tile usage policy of OSM").
-// CARTO's free basemap tiles are built for exactly this - same underlying OSM data, no referer/volume
-// gate - and come in a light/dark pair, matched to the page's own theme below.
+// CARTO's free tiles turned out to need the same thing - their "anonymous" basemaps.cartocdn.com
+// tiles now render an "API KEY REQUIRED" watermark baked into the image itself (still a 200 response,
+// so that only showed up by actually opening a tile, not from the HTTP status) - confirmed directly
+// before ruling it out too. Esri's long-standing free Canvas basemaps need no key and come in a
+// matched light/dark pair - minimal by design, which also suits sitting under a data overlay better
+// than a label-heavy basemap would.
 const tileStyle = css.getPropertyValue('--tile-style').trim();
-L.tileLayer(`https://{s}.basemaps.cartocdn.com/${tileStyle}/{z}/{x}/{y}{r}.png`, {
-  maxZoom: 19,
-  subdomains: 'abcd',
-  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+L.tileLayer(`https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/${tileStyle}/MapServer/tile/{z}/{y}/{x}`, {
+  maxZoom: 16,
+  attribution: '&copy; <a href="https://www.esri.com">Esri</a>, HERE, Garmin, FAO, NOAA, USGS',
 }).addTo(map);
 
 // --- Risk heatmap: a custom Leaflet layer (same pattern as Leaflet.heat and similar plugins) - a
