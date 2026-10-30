@@ -245,15 +245,22 @@ const RiskHeatLayer = L.Layer.extend({
     // transparent over most of the wider area by this value, while the Zeeland cluster itself stayed
     // solid where real risk is high)
 
-    // Native pixel resolution over the whole clip (measured ~110-130ms for a ~1000x614 view_bbox clip
-    // on 40 stations) - avoids the soft/blurred look a lower-res grid upscaled with image smoothing
-    // would give.
-    const img = ctx.createImageData(cw, ch);
+    // Computed at 1/4 resolution (one sample per 4x4 block) then upscaled back onto the full clip with
+    // bilinear smoothing - ~4x fewer IDW evaluations than native res. Unlike the earlier vector
+    // coastline (hard geometric edges, where this kind of upscaling showed visible blockiness), this
+    // surface is a smooth inverse-distance field with no sharp edges, so a rendered side-by-side at
+    // this scale showed no visible difference from a full-resolution compute.
+    const SCALE = 4;
+    const sw = Math.ceil(cw / SCALE), sh = Math.ceil(ch / SCALE);
+    const small = document.createElement('canvas');
+    small.width = sw; small.height = sh;
+    const sctx = small.getContext('2d');
+    const img = sctx.createImageData(sw, sh);
     const data = img.data;
-    for (let y = 0; y < ch; y++) {
-      const py = clipY0 + y;
-      for (let x = 0; x < cw; x++) {
-        const px = clipX0 + x;
+    for (let y = 0; y < sh; y++) {
+      const py = clipY0 + y * SCALE;
+      for (let x = 0; x < sw; x++) {
+        const px = clipX0 + x * SCALE;
         let wsum = 0, vsum = 0;
         for (const o of stationPx) {
           const dx = o.px - px, dy = o.py - py;
@@ -262,12 +269,15 @@ const RiskHeatLayer = L.Layer.extend({
         }
         const risk = vsum / (wsum + BG_WEIGHT);
         const t = Math.max(0, Math.min(1, risk / RISK_CLIP));
-        const o4 = (y * cw + x) * 4;
+        const o4 = (y * sw + x) * 4;
         data[o4] = riskColor[0]; data[o4 + 1] = riskColor[1]; data[o4 + 2] = riskColor[2];
         data[o4 + 3] = Math.round(t * MAX_OPACITY * 255);
       }
     }
-    ctx.putImageData(img, clipX0, clipY0);
+    sctx.putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(small, 0, 0, sw, sh, clipX0, clipY0, cw, ch);
   },
 });
 
