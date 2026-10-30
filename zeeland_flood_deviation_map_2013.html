@@ -305,7 +305,7 @@ playBtn.addEventListener('click', () => {
     // advances PLAY_STEP real steps per tick (dragging the slider by hand still moves one real 5-min
     // step at a time, full resolution). 190ms keeps a safety margin above the ~110-130ms worst-case
     // draw time measured for a native-resolution redraw of the wider view_bbox clip.
-    const PLAY_STEP = 6; // 30 real minutes per tick
+    const PLAY_STEP = 2; // 10 real minutes per tick
     timer = setInterval(() => {
       let v = +slider.value + PLAY_STEP;
       if (v > +slider.max) v = 0;
