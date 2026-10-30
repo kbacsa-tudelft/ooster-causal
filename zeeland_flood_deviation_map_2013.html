@@ -14,8 +14,7 @@
     --fg: #1b2430;
     --fg-muted: #5b6774;
     --grid: #e7ebee;
-    --risk-low: 42, 120, 214;
-    --risk-high: 227, 73, 72;
+    --risk-color: 227, 73, 72;
     --tile-style: World_Light_Gray_Base;
   }
   @media (prefers-color-scheme: dark) {
@@ -27,8 +26,7 @@
       --fg: #e7ebee;
       --fg-muted: #9aa5b1;
       --grid: #232a32;
-      --risk-low: 57, 135, 229;
-      --risk-high: 230, 103, 103;
+      --risk-color: 230, 103, 103;
       --tile-style: World_Dark_Gray_Base;
     }
   }
@@ -40,8 +38,7 @@
     --fg: #e7ebee;
     --fg-muted: #9aa5b1;
     --grid: #232a32;
-    --risk-low: 57, 135, 229;
-    --risk-high: 230, 103, 103;
+    --risk-color: 230, 103, 103;
     --tile-style: World_Dark_Gray_Base;
   }
   * { box-sizing: border-box; }
@@ -86,8 +83,7 @@
   .legend .item { display: flex; align-items: center; gap: 6px; }
   .legend .ramp {
     width: 160px; height: 10px; border-radius: 5px;
-    background: linear-gradient(to right, rgb(42,120,214), rgb(227,73,72));
-    opacity: 0.9;
+    background: linear-gradient(to right, rgba(var(--risk-color), 0), rgba(var(--risk-color), 0.85));
   }
   footer { max-width: 1100px; margin: 0 auto; padding: 0 28px 40px; color: var(--fg-muted); font-size: 0.8rem; line-height: 1.6; }
   @media (max-width: 600px) {
@@ -99,7 +95,7 @@
 <body>
 <header>
   <h1>Zeeland storm surge, Dec 2013 — interpolated flood-risk map (5-min model)</h1>
-  <p class="sub">A continuous risk surface across all of Zeeland, interpolated (inverse-distance-weighted) between every gauge over the real OpenStreetMap basemap (drag/zoom like any map) - blue is calm, red is at or above each gauge's own POT/EVT flood threshold (risk = |observed − predicted| / threshold, so every gauge's very different natural variability is normalized onto the same 0-1+ scale). Each gauge's contribution lingers and decays with a 3-hour half-life rather than switching on and off hour to hour, so a real spike fades out gradually instead of spiking and vanishing. The slider moves through the model's own native 5-minute resolution - every step is a real, measured timestep, not an interpolated one; autoplay advances in slightly larger jumps to keep a full playthrough watchable, but dragging the slider by hand reaches every real 5-minute reading. Drag the slider or press play to scrub through the event.</p>
+  <p class="sub">A continuous risk surface across Zeeland and the surrounding Dutch/Belgian border area, interpolated (inverse-distance-weighted) between every gauge over the real OpenStreetMap basemap (drag/zoom like any map) - transparent where calm, solid red at or above each gauge's own POT/EVT flood threshold (risk = |observed − predicted| / threshold, so every gauge's very different natural variability is normalized onto the same 0-1+ scale). The surface is computed well beyond Zeeland's own border so it can fade out on its own - most of that wider area reads as ~0 anyway, since every gauge the model has is in Zeeland - rather than ending in a visible box edge. Each gauge's contribution lingers and decays with a 3-hour half-life rather than switching on and off hour to hour, so a real spike fades out gradually instead of spiking and vanishing. The slider moves through the model's own native 5-minute resolution - every step is a real, measured timestep, not an interpolated one; autoplay advances in slightly larger jumps to keep a full playthrough watchable, but dragging the slider by hand reaches every real 5-minute reading. Drag the slider or press play to scrub through the event.</p>
 </header>
 <main>
   <div class="card">
@@ -123,10 +119,13 @@
   build time from the trained checkpoint's saved residual z-scores and POT/EVT threshold refit at
   risk=0.001 / initial_level=0.99 / num_candidates=100 (the best-F1 point from sweep_pot_params.py).
   The surface is an inverse-distance-weighted interpolation across the 40 gauges (of 77 total) with
-  enough validation data to fit a threshold at all, clipped to Zeeland itself - the model only ever
-  had gauges there, so this is interpolation between real measurements throughout the clipped area,
-  not extrapolation past it (the surrounding tiles are shown for context only, not scored). Event
-  window (2013-12-06 01:50 →
+  enough validation data to fit a threshold at all, computed over a bounding box around this stretch
+  of the Netherlands and Belgium (not just Zeeland's own tight bbox) so it can fade out on its own
+  before reaching an edge - a small constant background weight blended into the IDW sum is what makes
+  distance from every gauge actually pull risk toward 0 instead of the plain-IDW tendency to keep
+  echoing whichever gauge is nearest, however far; confirmed with a real test render before shipping.
+  The model only ever had gauges in Zeeland, so risk away from there is extrapolated, not measured -
+  which in practice mostly reads as transparent. Event window (2013-12-06 01:50 →
   2013-12-06 04:20) shown as a red band on the slider track. Basemap: Esri's free World Light/Dark
   Gray Base tiles (no key required) - osm.org's own tile server actively 403s embedded pages like this
   one (its usage policy is personal/low-volume only), and CARTO's free anonymous tiles turned out to
@@ -144,17 +143,12 @@ const DATA = {"stations":[{"id":"WL_antwerpen.prosperpolder","code":"antwerpen.p
 
 const css = getComputedStyle(document.documentElement);
 function cssColorTriplet(name) {
-  // "--risk-low: 42, 120, 214" -> [42,120,214]; parsed once at load like every other themed value on
+  // "--risk-color: 227, 73, 72" -> [227,73,72]; parsed once at load like every other themed value on
   // this page (a live OS theme flip is rare enough mid-session that a full reload is a fair trade -
   // see the matchMedia listener below).
   return css.getPropertyValue(name).trim().split(',').map(Number);
 }
-const riskLow = cssColorTriplet('--risk-low');
-const riskHigh = cssColorTriplet('--risk-high');
-function lerpColor(t) {
-  t = Math.max(0, Math.min(1, t));
-  return [0, 1, 2].map(i => Math.round(riskLow[i] + (riskHigh[i] - riskLow[i]) * t));
-}
+const riskColor = cssColorTriplet('--risk-color');
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => location.reload());
 
 const map = L.map('leaflet-map', { scrollWheelZoom: false });
@@ -215,20 +209,22 @@ const RiskHeatLayer = L.Layer.extend({
     ctx.clearRect(0, 0, W, H);
     if (W === 0 || H === 0) return;
 
-    // Clip to Zeeland itself (DATA.bbox), not the wider view (DATA.view_bbox) shown for geographic
-    // context - the model only ever has gauges in Zeeland, so interpolating further than that would
-    // be extrapolating past what the surrounding tiles already make clear is a different region.
-    // Corners are re-projected every redraw (map.latLngToContainerPoint) so the clip tracks pan/zoom.
+    // Clip to view_bbox (a bounding box around this stretch of the Netherlands/Belgium border, not
+    // just Zeeland's own tight bbox) so the surface has room to fade out on its own before reaching
+    // any edge, instead of ending in a visible rectangle - most of this wider area interpolates to
+    // ~0 anyway (every gauge the model has is in Zeeland), which is exactly the point: a soft,
+    // organic falloff standing in for a hard clip boundary. Corners are re-projected every redraw
+    // (map.latLngToContainerPoint) so the clip tracks pan/zoom.
     const corners = [
-      [DATA.bbox[1], DATA.bbox[0]], [DATA.bbox[1], DATA.bbox[2]],
-      [DATA.bbox[3], DATA.bbox[0]], [DATA.bbox[3], DATA.bbox[2]],
+      [DATA.view_bbox[1], DATA.view_bbox[0]], [DATA.view_bbox[1], DATA.view_bbox[2]],
+      [DATA.view_bbox[3], DATA.view_bbox[0]], [DATA.view_bbox[3], DATA.view_bbox[2]],
     ].map(([lat, lon]) => this._map.latLngToContainerPoint([lat, lon]));
     const clipX0 = Math.max(0, Math.floor(Math.min(...corners.map(c => c.x))));
     const clipX1 = Math.min(W, Math.ceil(Math.max(...corners.map(c => c.x))));
     const clipY0 = Math.max(0, Math.floor(Math.min(...corners.map(c => c.y))));
     const clipY1 = Math.min(H, Math.ceil(Math.max(...corners.map(c => c.y))));
     const cw = clipX1 - clipX0, ch = clipY1 - clipY0;
-    if (cw <= 0 || ch <= 0) return; // Zeeland is currently outside the viewport entirely
+    if (cw <= 0 || ch <= 0) return; // the clip box is currently outside the viewport entirely
 
     const riskRow = DATA.risk[this._timeIndex];
     const stationPx = DATA.stations
@@ -240,14 +236,18 @@ const RiskHeatLayer = L.Layer.extend({
       .filter(o => o !== null && o.risk !== null);
 
     const RISK_CLIP = 1.3; // ratio to each gauge's own threshold - 1.0 is "at the flagged boundary"
-    const OPACITY = 0.72; // constant - color (not fading opacity) carries the risk value, so the
-    // whole of Zeeland reads as a continuous surface instead of fading to the bare basemap away from
-    // any one gauge (inverse-distance weighting below has no cutoff or "background" term for the same
-    // reason - every point gets a real interpolated value from every gauge, near or far)
+    const MAX_OPACITY = 0.85; // single hue (--risk-color); opacity carries the risk value, 0 at
+    // risk=0 fading up to this at/above RISK_CLIP - transparent where calm or far from every gauge,
+    // solid red at real exceedances
+    const BG_WEIGHT = 5e-4; // implicit "background is risk-0" prior blended into the inverse-distance
+    // weights below - without it, IDW normalizes to whatever the *nearest* gauge says even far outside
+    // Zeeland (tuned empirically: a real test render at this bbox's scale showed clear fade-to-
+    // transparent over most of the wider area by this value, while the Zeeland cluster itself stayed
+    // solid where real risk is high)
 
-    // Native pixel resolution within the (much smaller) Zeeland clip - cheap enough to not need a
-    // coarse-grid-plus-upscale shortcut at all (measured: ~35ms for a full ~480x390 clip on 40
-    // stations), and avoids the soft/blurred look a lower-res grid upscaled with image smoothing gives.
+    // Native pixel resolution over the whole clip (measured ~110-130ms for a ~1000x614 view_bbox clip
+    // on 40 stations) - avoids the soft/blurred look a lower-res grid upscaled with image smoothing
+    // would give.
     const img = ctx.createImageData(cw, ch);
     const data = img.data;
     for (let y = 0; y < ch; y++) {
@@ -260,12 +260,11 @@ const RiskHeatLayer = L.Layer.extend({
           const w = 1 / (dx * dx + dy * dy + 100); // +100 (~10px) avoids a singularity right on a gauge
           wsum += w; vsum += w * o.risk;
         }
-        const risk = wsum > 0 ? vsum / wsum : 0;
+        const risk = vsum / (wsum + BG_WEIGHT);
         const t = Math.max(0, Math.min(1, risk / RISK_CLIP));
-        const [r, g, b] = lerpColor(t);
         const o4 = (y * cw + x) * 4;
-        data[o4] = r; data[o4 + 1] = g; data[o4 + 2] = b;
-        data[o4 + 3] = Math.round(OPACITY * 255);
+        data[o4] = riskColor[0]; data[o4 + 1] = riskColor[1]; data[o4 + 2] = riskColor[2];
+        data[o4 + 3] = Math.round(t * MAX_OPACITY * 255);
       }
     }
     ctx.putImageData(img, clipX0, clipY0);
@@ -304,15 +303,15 @@ playBtn.addEventListener('click', () => {
     // At native 5-min resolution there are ~1500 real steps (vs. ~127 in the old hourly version) -
     // playing through every single one at a safe-for-drawing interval would take minutes, so autoplay
     // advances PLAY_STEP real steps per tick (dragging the slider by hand still moves one real 5-min
-    // step at a time, full resolution). 130ms keeps a safety margin above the ~85ms worst-case draw
-    // time measured for a native-resolution redraw of the Zeeland clip.
+    // step at a time, full resolution). 190ms keeps a safety margin above the ~110-130ms worst-case
+    // draw time measured for a native-resolution redraw of the wider view_bbox clip.
     const PLAY_STEP = 6; // 30 real minutes per tick
     timer = setInterval(() => {
       let v = +slider.value + PLAY_STEP;
       if (v > +slider.max) v = 0;
       slider.value = v;
       render(v);
-    }, 130);
+    }, 190);
   } else {
     clearInterval(timer);
   }
