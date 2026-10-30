@@ -303,15 +303,18 @@ playBtn.addEventListener('click', () => {
     // At native 5-min resolution there are ~1500 real steps (vs. ~127 in the old hourly version) -
     // playing through every single one at a safe-for-drawing interval would take minutes, so autoplay
     // advances PLAY_STEP real steps per tick (dragging the slider by hand still moves one real 5-min
-    // step at a time, full resolution). 190ms keeps a safety margin above the ~110-130ms worst-case
-    // draw time measured for a native-resolution redraw of the wider view_bbox clip.
+    // step at a time, full resolution). 63ms is below the ~110-130ms worst-case draw time measured
+    // for a native-resolution redraw of the wider view_bbox clip, so on a slower machine draws may
+    // take longer than 63ms and effectively throttle the tick rate on their own rather than overlap -
+    // still fine (a tick is just a slider move + redraw, not queued work), just not literally 63ms
+    // everywhere.
     const PLAY_STEP = 2; // 10 real minutes per tick
     timer = setInterval(() => {
       let v = +slider.value + PLAY_STEP;
       if (v > +slider.max) v = 0;
       slider.value = v;
       render(v);
-    }, 190);
+    }, 63);
   } else {
     clearInterval(timer);
   }
